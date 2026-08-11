@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# PyInstaller
+build/
+dist/
+*.spec.bak
+
+# Ambiente virtual
+venv/
+
+# Arquivos locais sensíveis
+*.log
+sip_config.json
+
+# AppImage (artefato de build)
+*.AppImage
+
+# Editor e temporários
+.vscode/
+tempCodeRunnerFile.py

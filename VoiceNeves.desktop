@@ -1,0 +1,10 @@
+[Desktop Entry]
+Name=Voice Neves
+Comment=Softphone SIP com tkinter e pjsua2
+Exec=VoiceNeves
+Icon=Icone
+Terminal=false
+Type=Application
+Categories=Network;Telephony;
+StartupNotify=true
+StartupWMClass=Voiceneves

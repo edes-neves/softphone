@@ -1,0 +1,9 @@
+# Dependências de build/empacotamento
+pyinstaller>=6.0
+
+# Armazenamento seguro de senhas (keyring do sistema)
+# Opcional: sem keyring o app usa um arquivo local com permissão 0600.
+keyring>=24.0
+
+# NOTA: pjsua2 (PJSIP) não é distribuído via pip. Instale compilando o PJSIP
+# ou copiando o pacote .egg/so do sistema. Ver README.md.
