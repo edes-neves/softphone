@@ -37,6 +37,8 @@ A configuração fica fora do diretório do app, seguindo a especificação XDG:
 | ------------------ | ----------------------------------------- |
 | Config             | `~/.config/softphone/config.json` (0600)  |
 | Senhas (fallback)  | `~/.config/softphone/secrets.json` (0600) |
+| Histórico          | `~/.local/share/softphone/history.json`   |
+| Contatos           | `~/.local/share/softphone/contacts.json`  |
 | Log                | `~/.local/share/softphone/app.log`        |
 
 Senhas **não** são gravadas no `config.json` — ficam no keyring (ou no fallback

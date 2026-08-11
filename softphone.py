@@ -265,6 +265,31 @@ def is_valid_server(value):
     return bool(SERVER_RE.match(value or ""))
 
 
+def _as_bool(value):
+    """Converte valores de config (bool/str/int) em booleano."""
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    return str(value).strip().lower() in ("1", "true", "yes", "on")
+
+
+def _native_video_handle(xid):
+    """Cria um VideoWindowHandle apontando para uma janela nativa (embedding X11).
+
+    A enum opaque `type` do pjsua2 não é exposta corretamente no SWIG, então o
+    valor PJMEDIA_VID_DEV_NATIVE_WINDOW (=1) é gravado via ctypes.
+    """
+    import ctypes as _ct
+
+    h = pj.VideoWindowHandle()
+    t = h.type
+    _ct.c_int.from_address(int(t)).value = 1  # PJMEDIA_VID_DEV_NATIVE_WINDOW
+    h.type = t
+    h.handle.setWindow(int(xid))
+    return h
+
+
 # =========================
 # ARMAZENAMENTO DE SENHAS
 # =========================
@@ -374,6 +399,60 @@ def _normalize_accounts(accounts, secrets):
     return result
 
 
+def _clean_security(raw):
+    """Normaliza a seção de segurança (TLS/SRTP) da configuração."""
+    if not isinstance(raw, dict):
+        raw = {}
+    srtp = str(raw.get("srtp", "disabled") or "disabled")
+    if srtp not in ("disabled", "optional", "mandatory"):
+        srtp = "disabled"
+    return {
+        "tls": _as_bool(raw.get("tls")),
+        "tls_ca_file": str(raw.get("tls_ca_file", "") or ""),
+        "tls_cert_file": str(raw.get("tls_cert_file", "") or ""),
+        "tls_key_file": str(raw.get("tls_key_file", "") or ""),
+        "srtp": srtp,
+        "srtp_tls_only": _as_bool(raw.get("srtp_tls_only")),
+    }
+
+
+def _clean_nat(raw, secrets):
+    """Normaliza a seção NAT/STUN/TURN da configuração."""
+    if not isinstance(raw, dict):
+        raw = {}
+    return {
+        "stun_server": str(raw.get("stun_server", "") or ""),
+        "ice": _as_bool(raw.get("ice")),
+        "turn_enabled": _as_bool(raw.get("turn_enabled")),
+        "turn_server": str(raw.get("turn_server", "") or ""),
+        "turn_user": str(raw.get("turn_user", "") or ""),
+        "turn_password": secrets.get("turn", ""),
+    }
+
+
+def _clean_video(raw):
+    """Normaliza a seção de vídeo (câmera) da configuração."""
+    if not isinstance(raw, dict):
+        raw = {}
+    try:
+        device = int(raw.get("device", -1))
+    except (TypeError, ValueError):
+        device = -1
+    return {"device": device}
+
+
+def _default_config(secrets):
+    return {
+        "accounts": [],
+        "codecs": {"audio": {}, "video": {}},
+        "theme": "light",
+        "ringtone": "",
+        "security": _clean_security(None),
+        "nat": _clean_nat(None, secrets),
+        "video": _clean_video(None),
+    }
+
+
 def migrate_legacy_config(secrets):
     if not os.path.exists(LEGACY_CONFIG_FILE):
         return None
@@ -386,12 +465,8 @@ def migrate_legacy_config(secrets):
         return None
 
     accounts = _normalize_accounts(data.get("accounts"), secrets)
-    new_config = {
-        "accounts": accounts,
-        "codecs": {"audio": {}, "video": {}},
-        "theme": "light",
-        "ringtone": "",
-    }
+    new_config = _default_config(secrets)
+    new_config["accounts"] = accounts
     save_config(new_config)
     try:
         os.remove(LEGACY_CONFIG_FILE)
@@ -407,7 +482,7 @@ def load_config(secrets):
         if migrated is not None:
             return migrated
         os.makedirs(CONFIG_DIR, exist_ok=True)
-        return {"accounts": [], "codecs": {"audio": {}, "video": {}}, "theme": "light", "ringtone": ""}
+        return _default_config(secrets)
     try:
         with open(CONFIG_FILE, encoding="utf-8") as f:
             data = json.load(f)
@@ -424,10 +499,13 @@ def load_config(secrets):
             "codecs": codecs,
             "theme": theme,
             "ringtone": data.get("ringtone", ""),
+            "security": _clean_security(data.get("security")),
+            "nat": _clean_nat(data.get("nat"), secrets),
+            "video": _clean_video(data.get("video")),
         }
     except Exception as e:
         logging.error("Erro ao ler config (%s); usando configuração vazia", e)
-        return {"accounts": [], "codecs": {"audio": {}, "video": {}}, "theme": "light", "ringtone": ""}
+        return _default_config(secrets)
 
 
 def save_config(data):
@@ -437,11 +515,18 @@ def save_config(data):
         logging.error("Falha ao criar %s: %s", CONFIG_DIR, e)
         return
 
+    payload = dict(data)
+    nat = payload.get("nat")
+    if isinstance(nat, dict):
+        nat = dict(nat)
+        nat.pop("turn_password", None)
+        payload["nat"] = nat
+
     tmp_path = None
     try:
         fd, tmp_path = tempfile.mkstemp(dir=CONFIG_DIR, prefix=".config-", suffix=".tmp")
         with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=4, ensure_ascii=False)
+            json.dump(payload, f, indent=4, ensure_ascii=False)
         os.replace(tmp_path, CONFIG_FILE)
         os.chmod(CONFIG_FILE, 0o600)
     except OSError as e:
@@ -749,6 +834,8 @@ class SoftphoneApp:
         self.incoming_call = None
         self.calls = {}
         self.held_calls = set()
+        self.conf_active = False
+        self.conf_media = {}
         self.transfer_win = None
         self._pending_xfer = None
         self._switch_call_ids = []
@@ -767,6 +854,17 @@ class SoftphoneApp:
         self.codec_win = None
         self.edit_win = None
         self._edit_entry = None
+        self.adv_win = None
+
+        self.video_enabled = False
+        self._has_video = False
+        self.video_win = None
+        self.video_box = None
+        self.video_placeholder = None
+        self.video_preview_frame = None
+        self.video_preview_label = None
+        self._preview = None
+        self._remote_window = None
 
         self._main_tid = threading.get_ident()
         self._ui_queue = queue.Queue()
@@ -800,19 +898,65 @@ class SoftphoneApp:
         ep_cfg.logConfig.level = 5
         ep_cfg.logConfig.consoleLevel = 0
         try:
+            os.makedirs(DATA_DIR, exist_ok=True)
             ep_cfg.logConfig.filename = os.path.join(DATA_DIR, "pjsua.log")
         except Exception as e:
             logging.warning("Não foi possível definir log do pjsua: %s", e)
+
+        stun = str((self.config_data.get("nat") or {}).get("stun_server") or "")
+        if stun:
+            try:
+                ep_cfg.uaConfig.stunServer.push_back(stun)
+            except Exception as e:
+                logging.warning("Não foi possível aplicar STUN (%s): %s", stun, e)
+
         self.endpoint.libInit(ep_cfg)
 
+        self._udp_tid = None
+        self._tls_tid = None
         try:
             tcfg = pj.TransportConfig()
             tcfg.port = 0
-            self.endpoint.transportCreate(pj.PJSIP_TRANSPORT_UDP, tcfg)
+            self._udp_tid = self.endpoint.transportCreate(pj.PJSIP_TRANSPORT_UDP, tcfg)
         except Exception as e:
             logging.error("Erro ao criar transporte UDP: %s", e)
 
+        if (self.config_data.get("security") or {}).get("tls"):
+            self._create_tls_transport()
+
         self.endpoint.libStart()
+        self._detect_video_support()
+
+    def _detect_video_support(self):
+        try:
+            self._has_video = self.endpoint.vidDevManager().getDevCount() > 0
+        except Exception as e:
+            self._has_video = False
+            logging.warning("Não foi possível detectar suporte a vídeo: %s", e)
+        if not self._has_video:
+            logging.info("PJSUA sem dispositivos de vídeo; recursos de vídeo desativados")
+
+    def _create_tls_transport(self):
+        sec = self.config_data.get("security") or {}
+        try:
+            tcfg = pj.TransportConfig()
+            tcfg.port = 0
+            tls = tcfg.tlsConfig
+            ca_file = str(sec.get("tls_ca_file") or "")
+            try:
+                tls.CaListFile = ca_file
+            except (AttributeError, TypeError):
+                tls.caListFile = ca_file
+            tls.certFile = str(sec.get("tls_cert_file") or "")
+            tls.privKeyFile = str(sec.get("tls_key_file") or "")
+            tls.verifyServer = bool(sec.get("tls_ca_file"))
+            self._tls_tid = self.endpoint.transportCreate(pj.PJSIP_TRANSPORT_TLS, tcfg)
+            logging.info("Transporte TLS criado (id=%s)", self._tls_tid)
+        except Exception as e:
+            self._tls_tid = None
+            logging.error(
+                "Erro ao criar transporte TLS (verifique os arquivos de certificado): %s", e
+            )
 
     # =========================
     # UI
@@ -834,6 +978,8 @@ class SoftphoneApp:
         m_config = tk.Menu(menubar, tearoff=0)
         m_config.add_command(label="Configurações...", command=self.open_settings)
         m_config.add_command(label="Codecs...", command=self.open_codecs)
+        m_config.add_command(label="Vídeo...", command=self.open_video)
+        m_config.add_command(label="Segurança e NAT...", command=self.open_advanced)
         menubar.add_cascade(label="Configurações", menu=m_config)
 
         m_exibir = tk.Menu(menubar, tearoff=0)
@@ -1095,6 +1241,7 @@ class SoftphoneApp:
         dial_frame.grid(row=1, column=0, sticky="nsew", padx=12, pady=6)
         container.grid_rowconfigure(1, weight=2)
         dial_frame.grid_columnconfigure(0, weight=1)
+        dial_frame.grid_columnconfigure(1, weight=1)
 
         ttk.Label(dial_frame, text="Número").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=3)
         self.number = ttk.Entry(dial_frame)
@@ -1134,8 +1281,14 @@ class SoftphoneApp:
         self.btn_mute = self._styled_button(
             dial_frame, "Mute", self.toggle_mute, COLOR_WARNING, fg=COLOR_TEXT
         )
-        self.btn_mute.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(4, 4))
+        self.btn_mute.grid(row=3, column=0, sticky="ew", padx=(0, 4), pady=(4, 4))
         ToolTip(self.btn_mute, "Silenciar / reativar o microfone")
+
+        self.btn_video = self._styled_button(
+            dial_frame, "📹  Vídeo", self.toggle_video, COLOR_MUTED
+        )
+        self.btn_video.grid(row=3, column=1, sticky="ew", padx=(4, 0), pady=(4, 4))
+        ToolTip(self.btn_video, "Ligar / desligar o vídeo na chamada")
 
         feature_btns = tk.Frame(dial_frame, bg=COLOR_BG)
         feature_btns.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(4, 4))
@@ -1163,6 +1316,7 @@ class SoftphoneApp:
         active_frame = ttk.LabelFrame(dial_frame, text="Chamadas ativas")
         active_frame.grid(row=5, column=0, columnspan=2, sticky="ew", padx=12, pady=(4, 8))
         active_frame.grid_columnconfigure(0, weight=1)
+        active_frame.grid_columnconfigure(1, weight=1)
         self.call_switch_box = ttk.Combobox(active_frame, state="readonly")
         self.call_switch_box.grid(row=0, column=0, sticky="ew", padx=(4, 4), pady=4)
         self.btn_alternate = self._styled_button(
@@ -1170,6 +1324,22 @@ class SoftphoneApp:
         )
         self.btn_alternate.grid(row=0, column=1, sticky="ew", padx=(4, 4), pady=4)
         ToolTip(self.btn_alternate, "Alternar para a chamada selecionada acima")
+
+        self.btn_conference = self._styled_button(
+            active_frame, "👥  Conferência", self.start_conference, COLOR_PRIMARY
+        )
+        self.btn_conference.grid(row=1, column=0, sticky="ew", padx=(4, 4), pady=(4, 8))
+        ToolTip(
+            self.btn_conference,
+            "Iniciar conferência (3ª via). Depois disca o 2º número; ao atender, "
+            "as duas pernas entram na mesma chamada.",
+        )
+
+        self.btn_exit_conf = self._styled_button(
+            active_frame, "🚪  Sair da conferência", self.exit_conference, COLOR_DANGER
+        )
+        self.btn_exit_conf.grid(row=1, column=1, sticky="ew", padx=(4, 4), pady=(4, 8))
+        ToolTip(self.btn_exit_conf, "Encerrar a conferência e voltar para uma chamada normal")
 
     def _styled_button(self, parent, text, command, color, fg="#FFFFFF"):
         return RoundedButton(
@@ -1202,8 +1372,8 @@ class SoftphoneApp:
         if self.settings_win is None:
             win = tk.Toplevel(self.root)
             win.title("Configurações")
-            win.geometry("460x620")
-            win.minsize(420, 600)
+            win.geometry("460x520")
+            win.minsize(450, 460)
             win.transient(self.root)
             win.protocol("WM_DELETE_WINDOW", self._close_settings)
             self.settings_win = win
@@ -1214,6 +1384,99 @@ class SoftphoneApp:
         if self.settings_win is not None:
             self.settings_win.destroy()
             self.settings_win = None
+
+    def open_video(self):
+        if self.video_win is not None:
+            try:
+                self.video_win.deiconify()
+                self.video_win.lift()
+            except tk.TclError:
+                self.video_win = None
+        if self.video_win is None:
+            win = tk.Toplevel(self.root)
+            win.title("Vídeo")
+            win.geometry("560x820")
+            win.minsize(520, 740)
+            win.transient(self.root)
+            win.protocol("WM_DELETE_WINDOW", self._close_video)
+            self.video_win = win
+            self._build_video_ui(win)
+            self.load_devices()
+        if self.video_win is not None:
+            try:
+                self.video_win.lift()
+            except tk.TclError:
+                pass
+
+    def _close_video(self):
+        self._stop_preview()
+        if self._remote_window is not None:
+            try:
+                self._remote_window.hide()
+            except Exception:
+                pass
+            self._remote_window = None
+        if self.video_win is not None:
+            try:
+                self.video_win.destroy()
+            except tk.TclError:
+                pass
+            self.video_win = None
+
+    def _build_video_ui(self, win):
+        container = ttk.Frame(win, padding=10)
+        container.pack(fill=tk.BOTH, expand=True)
+        container.grid_columnconfigure(0, weight=1)
+        container.grid_rowconfigure(0, weight=1)
+
+        call_frame = ttk.LabelFrame(container, text="Vídeo da chamada")
+        call_frame.grid(row=0, column=0, sticky="nsew", pady=(0, 10))
+        call_frame.grid_columnconfigure(0, weight=1)
+        call_frame.grid_rowconfigure(0, weight=1, minsize=320)
+
+        self.video_box = tk.Frame(call_frame, bg="black", width=420, height=360)
+        self.video_box.grid(row=0, column=0, sticky="nsew")
+        self.video_box.grid_propagate(False)
+        self.video_placeholder = tk.Label(
+            self.video_box, text="Vídeo desligado", bg="black", fg="#888888"
+        )
+        self.video_placeholder.pack(expand=True, fill=tk.BOTH)
+
+        cam_frame = ttk.LabelFrame(container, text="Câmera")
+        cam_frame.grid(row=1, column=0, sticky="ew", pady=(0, 4))
+        cam_frame.grid_columnconfigure(1, weight=1)
+
+        ttk.Label(cam_frame, text="Câmera").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=3)
+        self.video_devices = ttk.Combobox(cam_frame, state="readonly")
+        self.video_devices.grid(row=0, column=1, sticky="ew", pady=3)
+        ToolTip(self.video_devices, "Câmera usada nas chamadas de vídeo (padrão = primeira disponível)")
+
+        cam_btns = tk.Frame(cam_frame, bg=COLOR_BG)
+        cam_btns.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(4, 4))
+        for c in range(3):
+            cam_btns.grid_columnconfigure(c, weight=1)
+
+        self.btn_cam_apply = self._styled_button(
+            cam_btns, "Aplicar câmera", self.apply_camera, COLOR_PRIMARY
+        )
+        self.btn_cam_apply.grid(row=0, column=0, sticky="ew", padx=(0, 4))
+        self.btn_video_preview = self._styled_button(
+            cam_btns, "Ver prévia", self._toggle_preview, COLOR_MUTED
+        )
+        self.btn_video_preview.grid(row=0, column=1, sticky="ew", padx=4)
+        self.btn_video_preview_close = self._styled_button(
+            cam_btns, "Fechar prévia", self._stop_preview, COLOR_MUTED
+        )
+        self.btn_video_preview_close.grid(row=0, column=2, sticky="ew", padx=(4, 0))
+
+        cam_frame.grid_rowconfigure(2, weight=1, minsize=180)
+        self.video_preview_frame = tk.Frame(cam_frame, bg="black", width=400, height=180)
+        self.video_preview_frame.grid(row=2, column=0, columnspan=2, sticky="nsew", pady=(4, 4))
+        self.video_preview_frame.grid_propagate(False)
+        self.video_preview_label = tk.Label(
+            self.video_preview_frame, text="Prévia desligada", bg="black", fg="#888888"
+        )
+        self.video_preview_label.pack(expand=True, fill=tk.BOTH)
 
     def _build_settings_ui(self, win):
         container = ttk.Frame(win, padding=10)
@@ -1330,6 +1593,191 @@ class SoftphoneApp:
             ring_btns, "Padrão", self._reset_ringtone, COLOR_MUTED
         )
         self.btn_ring_default.grid(row=0, column=2, sticky="ew", padx=(4, 0))
+
+    # =========================
+    # =========================
+    # SEGURANÇA E NAT (avançado)
+    # =========================
+    def open_advanced(self):
+        if self.adv_win is not None:
+            try:
+                self.adv_win.deiconify()
+                self.adv_win.lift()
+            except tk.TclError:
+                self.adv_win = None
+        if self.adv_win is None:
+            win = tk.Toplevel(self.root)
+            win.title("Segurança e NAT")
+            win.geometry("460x620")
+            win.minsize(420, 610)
+            win.transient(self.root)
+            win.protocol("WM_DELETE_WINDOW", self._close_advanced)
+            self.adv_win = win
+            self._build_advanced_ui(win)
+        if self.adv_win is not None:
+            try:
+                self.adv_win.lift()
+            except tk.TclError:
+                pass
+
+    def _close_advanced(self):
+        if self.adv_win is not None:
+            try:
+                self.adv_win.destroy()
+            except tk.TclError:
+                pass
+            self.adv_win = None
+
+    def _build_advanced_ui(self, win):
+        container = ttk.Frame(win, padding=10)
+        container.pack(fill=tk.BOTH, expand=True)
+        container.grid_columnconfigure(0, weight=1)
+
+        adv = ttk.LabelFrame(container, text="Segurança e NAT")
+        adv.grid(row=0, column=0, sticky="nsew")
+        adv.grid_columnconfigure(1, weight=1)
+
+        nat = self.config_data.get("nat") or {}
+        sec = self.config_data.get("security") or {}
+        srtp_labels = {
+            "disabled": "Desabilitado",
+            "optional": "Opcional",
+            "mandatory": "Obrigatório",
+        }
+
+        r = 0
+        ttk.Label(adv, text="Servidor STUN").grid(row=r, column=0, sticky="w", padx=(0, 8), pady=3)
+        self.adv_stun = ttk.Entry(adv)
+        self.adv_stun.insert(0, nat.get("stun_server", ""))
+        self.adv_stun.grid(row=r, column=1, sticky="ew", pady=3)
+        ToolTip(self.adv_stun, "Servidor STUN para atravessar NAT (ex.: stun.cloudflare.com:3478). Vazio = sem STUN.")
+
+        r += 1
+        self.adv_ice = tk.BooleanVar(value=_as_bool(nat.get("ice")))
+        ttk.Checkbutton(adv, text="Habilitar ICE (recomendado com STUN/TURN)",
+                        variable=self.adv_ice).grid(row=r, column=0, columnspan=2, sticky="w", pady=3)
+
+        r += 1
+        self.adv_turn_enabled = tk.BooleanVar(value=_as_bool(nat.get("turn_enabled")))
+        ttk.Checkbutton(adv, text="Habilitar TURN (reencaminhamento de mídia)",
+                        variable=self.adv_turn_enabled).grid(row=r, column=0, columnspan=2, sticky="w", pady=3)
+
+        r += 1
+        ttk.Label(adv, text="Servidor TURN").grid(row=r, column=0, sticky="w", padx=(0, 8), pady=3)
+        self.adv_turn_server = ttk.Entry(adv)
+        self.adv_turn_server.insert(0, nat.get("turn_server", ""))
+        self.adv_turn_server.grid(row=r, column=1, sticky="ew", pady=3)
+
+        r += 1
+        ttk.Label(adv, text="Usuário TURN").grid(row=r, column=0, sticky="w", padx=(0, 8), pady=3)
+        self.adv_turn_user = ttk.Entry(adv)
+        self.adv_turn_user.insert(0, nat.get("turn_user", ""))
+        self.adv_turn_user.grid(row=r, column=1, sticky="ew", pady=3)
+
+        r += 1
+        ttk.Label(adv, text="Senha TURN").grid(row=r, column=0, sticky="w", padx=(0, 8), pady=3)
+        self.adv_turn_password = ttk.Entry(adv, show="*")
+        self.adv_turn_password.grid(row=r, column=1, sticky="ew", pady=3)
+        ToolTip(self.adv_turn_password, "Nova senha TURN (vazio = manter a atual, guardada no cofre de senhas)")
+
+        r += 1
+        self.adv_tls = tk.BooleanVar(value=_as_bool(sec.get("tls")))
+        ttk.Checkbutton(adv, text="Usar TLS (SIPS) nas contas",
+                        variable=self.adv_tls).grid(row=r, column=0, columnspan=2, sticky="w", pady=3)
+
+        for label, short, key in (
+            ("Arquivo CA (opcional)", "tls_ca", "tls_ca_file"),
+            ("Certificado (opcional)", "tls_cert", "tls_cert_file"),
+            ("Chave privada (opcional)", "tls_key", "tls_key_file"),
+        ):
+            r += 1
+            ttk.Label(adv, text=label).grid(row=r, column=0, sticky="w", padx=(0, 8), pady=3)
+            row_frame = tk.Frame(adv, bg=COLOR_BG)
+            row_frame.grid(row=r, column=1, sticky="ew", pady=3)
+            row_frame.grid_columnconfigure(0, weight=1)
+            entry = ttk.Entry(row_frame)
+            entry.insert(0, sec.get(key, ""))
+            entry.grid(row=0, column=0, sticky="ew", padx=(0, 4))
+            setattr(self, f"adv_{short}", entry)
+            self._styled_button(
+                row_frame, "…", lambda e=entry: self._pick_file(e), COLOR_MUTED
+            ).grid(row=0, column=1)
+
+        r += 1
+        ttk.Label(adv, text="SRTP").grid(row=r, column=0, sticky="w", padx=(0, 8), pady=3)
+        self.adv_srtp = ttk.Combobox(
+            adv, state="readonly",
+            values=[srtp_labels[k] for k in ("disabled", "optional", "mandatory")],
+        )
+        self.adv_srtp.set(srtp_labels.get(str(sec.get("srtp") or "disabled"), "Desabilitado"))
+        self.adv_srtp.grid(row=r, column=1, sticky="ew", pady=3)
+        ToolTip(self.adv_srtp, "SRTP protege o áudio da chamada. 'Obrigatório' exige SRTP em todas as chamadas.")
+
+        r += 1
+        self.adv_srtp_tls = tk.BooleanVar(value=_as_bool(sec.get("srtp_tls_only")))
+        ttk.Checkbutton(adv, text="SRTP somente com TLS (SIPS)",
+                        variable=self.adv_srtp_tls).grid(row=r, column=0, columnspan=2, sticky="w", pady=3)
+
+        r += 1
+        self._styled_button(adv, "💾  Salvar segurança/NAT", self._save_advanced, COLOR_SUCCESS).grid(
+            row=r, column=0, columnspan=2, sticky="ew", pady=(8, 4))
+
+        r += 1
+        ttk.Label(
+            adv, text="Alterações de transporte (TLS/STUN/TURN) só valem após reiniciar o app.",
+            style="Muted.TLabel", wraplength=400, justify=tk.LEFT,
+        ).grid(row=r, column=0, columnspan=2, sticky="w", pady=(0, 4))
+
+
+    def _pick_file(self, entry):
+        path = filedialog.askopenfilename(
+            parent=self.adv_win,
+            title="Selecionar arquivo",
+            filetypes=[
+                ("Todos os arquivos", "*.*"),
+                ("Certificado/Chave", "*.pem *.crt *.cer *.key"),
+            ],
+        )
+        if path:
+            entry.delete(0, tk.END)
+            entry.insert(0, path)
+
+    def _save_advanced(self):
+        if self.adv_win is None:
+            return
+        srtp_labels = {
+            "Desabilitado": "disabled",
+            "Opcional": "optional",
+            "Obrigatório": "mandatory",
+        }
+        sec = {
+            "tls": bool(self.adv_tls.get()),
+            "tls_ca_file": self.adv_tls_ca.get().strip(),
+            "tls_cert_file": self.adv_tls_cert.get().strip(),
+            "tls_key_file": self.adv_tls_key.get().strip(),
+            "srtp": srtp_labels.get(self.adv_srtp.get(), "disabled"),
+            "srtp_tls_only": bool(self.adv_srtp_tls.get()),
+        }
+        turn_pw = self.adv_turn_password.get()
+        if turn_pw:
+            secrets.set("turn", turn_pw)
+        nat = {
+            "stun_server": self.adv_stun.get().strip(),
+            "ice": bool(self.adv_ice.get()),
+            "turn_enabled": bool(self.adv_turn_enabled.get()),
+            "turn_server": self.adv_turn_server.get().strip(),
+            "turn_user": self.adv_turn_user.get().strip(),
+            "turn_password": secrets.get("turn", ""),
+        }
+        self.config_data["security"] = sec
+        self.config_data["nat"] = nat
+        save_config(self.config_data)
+        messagebox.showinfo(
+            "Segurança e NAT",
+            "Configurações salvas.\n\nTLS, STUN, TURN e SRTP nas contas só terão efeito "
+            "após reiniciar o aplicativo.",
+            parent=self.adv_win,
+        )
 
     def on_keypad_press(self, digit):
         if self.current_call is not None and self.call_state == "IN_CALL":
@@ -1619,6 +2067,10 @@ class SoftphoneApp:
         acfg.idUri = f"sip:{user}@{server}"
         acfg.regConfig.registrarUri = f"sip:{server}"
 
+        self._apply_security_config(acfg)
+        self._apply_nat_config(acfg)
+        self._apply_video_config(acfg)
+
         password = secrets.get(f"{user}@{server}", "")
         cred = pj.AuthCredInfo("digest", "*", user, 0, password)
         acfg.sipConfig.authCreds.append(cred)
@@ -1629,6 +2081,60 @@ class SoftphoneApp:
             acc.setDefault()
 
         self.accounts.append({"acc": acc, "data": dict(data), "status": "REGISTERING"})
+
+    def _apply_security_config(self, acfg):
+        sec = self.config_data.get("security") or {}
+        if self._tls_tid is not None:
+            try:
+                acfg.sipConfig.transportId = self._tls_tid
+            except Exception as e:
+                logging.warning("Não foi possível usar o transporte TLS na conta: %s", e)
+
+        srtp = str(sec.get("srtp") or "disabled")
+        if srtp != "disabled":
+            try:
+                if srtp == "mandatory":
+                    acfg.mediaConfig.srtpUse = pj.PJMEDIA_SRTP_MANDATORY
+                else:
+                    acfg.mediaConfig.srtpUse = pj.PJMEDIA_SRTP_OPTIONAL
+                if sec.get("srtp_tls_only"):
+                    try:
+                        acfg.mediaConfig.srtpSecureSignaling = pj.PJMEDIA_SRTP_USE_SRTP
+                    except AttributeError:
+                        acfg.mediaConfig.srtpSecureSignaling = 1  # PJMEDIA_SRTP_USE_SRTP
+            except Exception as e:
+                logging.warning("Não foi possível aplicar SRTP na conta: %s", e)
+
+    def _apply_nat_config(self, acfg):
+        nat = self.config_data.get("nat") or {}
+        try:
+            acfg.natConfig.iceEnabled = bool(nat.get("ice"))
+        except Exception as e:
+            logging.warning("Não foi possível ativar ICE: %s", e)
+
+        if nat.get("turn_enabled") and str(nat.get("turn_server") or ""):
+            try:
+                acfg.natConfig.turnEnabled = True
+                acfg.natConfig.turnServer = str(nat.get("turn_server"))
+                acfg.natConfig.turnUserName = str(nat.get("turn_user") or "")
+                acfg.natConfig.turnPassword = str(nat.get("turn_password") or "")
+                try:
+                    acfg.natConfig.turnConnType = pj.PJ_TURN_TP_UDP
+                except Exception:
+                    pass
+            except Exception as e:
+                logging.warning("Não foi possível aplicar TURN: %s", e)
+
+    def _apply_video_config(self, acfg):
+        try:
+            vcfg = acfg.videoConfig
+            vcfg.autoShowIncoming = True
+            vcfg.autoTransmitOutgoing = True
+            vid = (self.config_data.get("video") or {}).get("device", -1)
+            if isinstance(vid, int) and vid >= 0:
+                vcfg.defaultCaptureDevice = vid
+        except Exception as e:
+            logging.warning("Não foi possível aplicar configuração de vídeo: %s", e)
 
     def edit_account(self):
         if self.call_state != "IDLE":
@@ -1957,7 +2463,10 @@ class SoftphoneApp:
 
             self.muted = False
             self.current_call = MyCall(entry["acc"], self)
-            self.current_call.makeCall(dest, pj.CallOpParam(True))
+            op = pj.CallOpParam(False)
+            op.opt.audioCount = 1
+            op.opt.videoCount = 1 if (self.video_enabled and self._has_video) else 0
+            self.current_call.makeCall(dest, op)
             self._track_call(self.current_call)
             self.held_calls.discard(self.current_call.getId())
             self.set_call_state("CALLING")
@@ -1991,8 +2500,10 @@ class SoftphoneApp:
         if self.current_call is None:
             return
         try:
-            op = pj.CallOpParam()
+            op = pj.CallOpParam(False)
             op.statusCode = 200
+            op.opt.audioCount = 1
+            op.opt.videoCount = 1 if (self.video_enabled and self._has_video) else 0
             self.current_call.answer(op)
             self.incoming_call = None
             self.set_call_state("CALLING")
@@ -2008,6 +2519,7 @@ class SoftphoneApp:
         self.current_audio_media = None
         self.muted = False
         self.btn_mute.config(text="Mute")
+        self._teardown_video_ui()
 
         if call is not None:
             try:
@@ -2047,7 +2559,19 @@ class SoftphoneApp:
             self._stop_ringback()
             if self._pending_xfer is not None and self._pending_xfer.get("dst") is call:
                 self._complete_attended_xfer(call)
-            if call is self.current_call:
+            elif self.conf_active:
+                self._add_leg_to_conference(call)
+                for cid in list(self.conf_media):
+                    c = self.calls.get(cid)
+                    if (
+                        c is not None
+                        and cid != call.getId()
+                        and cid in self.held_calls
+                    ):
+                        self._unhold_call(c)
+                if call is self.current_call:
+                    self.set_call_state("IN_CALL")
+            elif call is self.current_call:
                 self._connect_call_media(call)
                 self.set_call_state("IN_CALL")
         elif ci.state == pj.PJSIP_INV_STATE_DISCONNECTED:
@@ -2191,6 +2715,7 @@ class SoftphoneApp:
 
     def _after_call_ended(self, call):
         self._forget_call(call)
+        self._remove_leg_from_conference(call)
         self._stop_ringback()
         nxt = self._pick_other_call(exclude=call)
         if nxt is not None:
@@ -2201,9 +2726,16 @@ class SoftphoneApp:
             self.current_audio_media = None
             self.muted = False
             self.btn_mute.config(text="Mute")
+            self._teardown_video_ui()
             self.set_call_state("IDLE")
 
     def toggle_hold(self):
+        if self.conf_active:
+            messagebox.showinfo(
+                "Espera",
+                "Durante a conferência use os botões de conferência para gerenciar as pernas.",
+            )
+            return
         call = self.current_call
         if call is None or self.call_state not in ("IN_CALL", "HOLD"):
             return
@@ -2373,6 +2905,173 @@ class SoftphoneApp:
             logging.error("Erro ao completar transferência: %s", e)
             messagebox.showerror("Transferir", f"Falha ao concluir a transferência: {e}")
 
+    # =========================
+    # CONFERÊNCIA (3ª via)
+    # =========================
+    def _call_audio_media(self, call):
+        """Retorna a AudioMedia ativa de uma chamada confirmada (ou None)."""
+        try:
+            ci = call.getInfo()
+        except Exception:
+            return None
+        for mi in ci.media:
+            if (
+                mi.type == pj.PJMEDIA_TYPE_AUDIO
+                and mi.status == pj.PJSUA_CALL_MEDIA_ACTIVE
+            ):
+                try:
+                    med = call.getMedia(mi.index)
+                except Exception as e:
+                    logging.warning("Falha ao obter mídia da chamada: %s", e)
+                    return None
+                return pj.AudioMedia.typecastFromMedia(med)
+        return None
+
+    def _conference_devices(self):
+        adm = self.endpoint.audDevManager()
+        return adm.getCaptureDevMedia(), adm.getPlaybackDevMedia()
+
+    def start_conference(self):
+        if self.conf_active:
+            return
+        call = self.current_call
+        if call is None or self.call_state != "IN_CALL" or not self._call_is_confirmed(call):
+            messagebox.showwarning(
+                "Conferência", "É preciso estar em uma chamada ativa para iniciar a conferência."
+            )
+            return
+        audio = self._call_audio_media(call)
+        if audio is None:
+            messagebox.showwarning(
+                "Conferência", "A chamada ainda não possui áudio ativo."
+            )
+            return
+        try:
+            mic, spk = self._conference_devices()
+            self._disconnect_call_media()
+            if not self.muted:
+                mic.startTransmit(audio)
+            audio.startTransmit(spk)
+            cid = call.getId()
+            self.conf_media[cid] = audio
+            self.conf_active = True
+            self.record_call("Conferência iniciada")
+            logging.info("Conferência iniciada com a chamada %s", cid)
+            self.update_call_ui()
+        except Exception as e:
+            logging.error("Erro ao iniciar conferência: %s", e)
+            self._teardown_conference()
+            messagebox.showerror("Conferência", f"Falha ao iniciar a conferência: {e}")
+
+    def _add_leg_to_conference(self, call):
+        if not self.conf_active:
+            return
+        try:
+            cid = call.getId()
+        except Exception:
+            return
+        if cid in self.conf_media:
+            return
+        audio = self._call_audio_media(call)
+        if audio is None:
+            return
+        try:
+            mic, spk = self._conference_devices()
+            if not self.muted:
+                mic.startTransmit(audio)
+            audio.startTransmit(spk)
+            for other_audio in list(self.conf_media.values()):
+                audio.startTransmit(other_audio)
+                other_audio.startTransmit(audio)
+            self.conf_media[cid] = audio
+            self.held_calls.discard(cid)
+            logging.info("Perna %s adicionada à conferência (3 vias)", cid)
+        except Exception as e:
+            logging.error("Erro ao adicionar perna %s à conferência: %s", cid, e)
+
+    def _remove_leg_from_conference(self, call):
+        if not self.conf_active:
+            return
+        try:
+            cid = call.getId()
+        except Exception:
+            return
+        audio = self.conf_media.pop(cid, None)
+        if audio is None:
+            return
+        try:
+            mic, spk = self._conference_devices()
+            try:
+                mic.stopTransmit(audio)
+            except Exception:
+                pass
+            try:
+                audio.stopTransmit(spk)
+            except Exception:
+                pass
+            for other_audio in list(self.conf_media.values()):
+                try:
+                    audio.stopTransmit(other_audio)
+                except Exception:
+                    pass
+                try:
+                    other_audio.stopTransmit(audio)
+                except Exception:
+                    pass
+            logging.info("Perna %s removida da conferência", cid)
+        except Exception as e:
+            logging.error("Erro ao remover perna %s da conferência: %s", cid, e)
+        if not self.conf_media:
+            self._teardown_conference()
+            logging.info("Conferência encerrada (sem pernas restantes)")
+
+    def _teardown_conference(self):
+        media = list(self.conf_media.values())
+        self.conf_media = {}
+        self.conf_active = False
+        if not media:
+            return
+        try:
+            mic, spk = self._conference_devices()
+        except Exception:
+            return
+        for audio in media:
+            try:
+                mic.stopTransmit(audio)
+            except Exception:
+                pass
+            try:
+                audio.stopTransmit(spk)
+            except Exception:
+                pass
+            for other in media:
+                if other is audio:
+                    continue
+                try:
+                    audio.stopTransmit(other)
+                except Exception:
+                    pass
+
+    def exit_conference(self):
+        if not self.conf_active:
+            return
+        legs = [self.calls[cid] for cid in list(self.conf_media) if cid in self.calls]
+        self._teardown_conference()
+        self.current_audio_media = None
+        if legs:
+            nxt = self.current_call if self.current_call in legs else legs[0]
+            for c in legs:
+                if c is not nxt and self._call_is_confirmed(c):
+                    self._hold_call(c)
+            self._activate_call(nxt)
+        else:
+            self.current_call = None
+            self.incoming_call = None
+            self.muted = False
+            self.set_call_state("IDLE")
+        self.record_call("Conferência encerrada")
+        self.update_call_ui()
+
     def pickup_call(self):
         code = self.pickup_code
         self.number.delete(0, tk.END)
@@ -2380,12 +3079,16 @@ class SoftphoneApp:
         self.make_call()
 
     def _connect_call_media(self, call):
+        if self.conf_active:
+            self._add_leg_to_conference(call)
+            return
         try:
             ci = call.getInfo()
         except Exception as e:
             logging.warning("Sessão de chamada já encerrada no media state: %s", e)
             return
         try:
+            has_video = False
             for mi in ci.media:
                 if (
                     mi.type == pj.PJMEDIA_TYPE_AUDIO
@@ -2403,9 +3106,68 @@ class SoftphoneApp:
 
                     self.current_audio_media = audio
                     self.apply_volumes()
-                    return
+                elif (
+                    mi.type == pj.PJMEDIA_TYPE_VIDEO
+                    and mi.status == pj.PJSUA_CALL_MEDIA_ACTIVE
+                ):
+                    if self._attach_remote_video(mi):
+                        has_video = True
+            if has_video:
+                self._show_video_area(True)
+            else:
+                self._teardown_video_ui()
         except Exception as e:
-            logging.error("Erro de áudio na chamada: %s", e)
+            logging.error("Erro de mídia na chamada: %s", e)
+
+    def _attach_remote_video(self, mi):
+        try:
+            if mi.videoIncomingWindowId == pj.PJSUA_INVALID_ID:
+                return False
+        except Exception:
+            return False
+        try:
+            win = mi.videoWindow
+        except Exception as e:
+            logging.warning("Vídeo remoto indisponível: %s", e)
+            return False
+        if win is None:
+            return False
+        self.open_video()
+        self._remote_window = win
+        frame = self.video_box
+        if frame is None or not frame.winfo_exists():
+            return False
+        try:
+            frame.update_idletasks()
+            xid = frame.winfo_id()
+        except Exception as e:
+            logging.warning("Não foi possível obter a janela de vídeo: %s", e)
+            return False
+        try:
+            if self.video_placeholder is not None:
+                self.video_placeholder.pack_forget()
+            win.setWindow(_native_video_handle(xid))
+            win.Show(True)
+            logging.info("Vídeo remoto anexado à janela do app (xid=%s)", xid)
+            return True
+        except Exception as e:
+            logging.warning("Não foi possível anexar o vídeo remoto: %s", e)
+            return False
+
+    def _show_video_area(self, show=True):
+        if show:
+            self.open_video()
+
+    def _teardown_video_ui(self):
+        self._remote_window = None
+        box = self.video_box
+        if box is not None:
+            try:
+                box.configure(bg="black")
+                if self.video_placeholder is not None:
+                    self.video_placeholder.pack(expand=True, fill=tk.BOTH)
+            except Exception:
+                pass
 
     def on_call_media_state(self, call):
         if call is self.current_call:
@@ -2610,7 +3372,9 @@ class SoftphoneApp:
 
     def update_call_ui(self):
         busy = self.call_state in ("CALLING", "RINGING", "INCOMING", "IN_CALL", "HOLD")
-        self.btn_call.config(state=tk.NORMAL if not busy else tk.DISABLED)
+        self.btn_call.config(
+            state=tk.NORMAL if (not busy or self.conf_active) else tk.DISABLED
+        )
         self.btn_answer.config(
             state=tk.NORMAL if self.call_state == "INCOMING" else tk.DISABLED
         )
@@ -2632,6 +3396,23 @@ class SoftphoneApp:
             )
         if hasattr(self, "btn_pickup"):
             self.btn_pickup.config(state=tk.NORMAL)
+        if hasattr(self, "btn_video"):
+            self._update_video_btn()
+        if hasattr(self, "btn_conference"):
+            self.btn_conference.config(
+                state=tk.NORMAL
+                if (
+                    not self.conf_active
+                    and self.current_call is not None
+                    and self.call_state == "IN_CALL"
+                    and self._call_is_confirmed(self.current_call)
+                )
+                else tk.DISABLED
+            )
+        if hasattr(self, "btn_exit_conf"):
+            self.btn_exit_conf.config(
+                state=tk.NORMAL if self.conf_active else tk.DISABLED
+            )
         self.refresh_call_switcher()
 
     def _blink_answer(self, active=None):
@@ -2692,6 +3473,39 @@ class SoftphoneApp:
             logging.error("Erro no mute: %s", e)
 
     # =========================
+    # VÍDEO
+    # =========================
+    def toggle_video(self):
+        if not self._has_video:
+            messagebox.showinfo("Vídeo indisponível", "O pjsua deste sistema não suporta vídeo.")
+            return
+        self.video_enabled = not self.video_enabled
+        self._update_video_btn()
+        call = self.current_call
+        if call is None or not self._call_is_confirmed(call) or self.call_state != "IN_CALL":
+            return
+        try:
+            op = pj.CallOpParam(False)
+            op.opt.audioCount = 1
+            op.opt.videoCount = 1 if self.video_enabled else 0
+            op.opt.flag = pj.PJSUA_CALL_UPDATE_CONTACT
+            call.reinvite(op)
+            logging.info("Vídeo %s na chamada atual", "ativado" if self.video_enabled else "desativado")
+        except Exception as e:
+            logging.error("Erro ao atualizar vídeo na chamada: %s", e)
+
+    def _update_video_btn(self):
+        if not hasattr(self, "btn_video"):
+            return
+        if not self._has_video:
+            self.btn_video.config(text="📹  Vídeo", bg=COLOR_MUTED, state="disabled")
+            return
+        if self.video_enabled:
+            self.btn_video.config(text="📹  Vídeo ON", bg=COLOR_PRIMARY)
+        else:
+            self.btn_video.config(text="📹  Vídeo", bg=COLOR_MUTED)
+
+    # =========================
     # DISPOSITIVOS
     # =========================
     def load_devices(self):
@@ -2708,9 +3522,34 @@ class SoftphoneApp:
             if d.outputCount:
                 outs.append((index, d.name))
 
+        cams = []
+        try:
+            vdevs = self.endpoint.vidDevManager().enumDev2()
+            for index, d in enumerate(vdevs):
+                if d.dir & pj.PJMEDIA_DIR_CAPTURE:
+                    cams.append((index, d.name))
+        except Exception as e:
+            logging.error("Erro ao listar câmeras: %s", e)
+
         if self.settings_win is not None:
             self.input_devices["values"] = [f"{i} | {n}" for i, n in ins]
             self.output_devices["values"] = [f"{i} | {n}" for i, n in outs]
+
+        if self.video_win is not None:
+            self.video_devices["values"] = [f"{i} | {n}" for i, n in cams]
+            saved = (self.config_data.get("video") or {}).get("device", -1)
+            current = f"{saved} | ..."
+            for label in self.video_devices["values"]:
+                if label.startswith(f"{saved} | "):
+                    current = label
+                    break
+            self.video_devices.set(current if saved >= 0 else "")
+
+    def _selected_camera(self):
+        try:
+            return int(self.video_devices.get().split(" | ")[0])
+        except (ValueError, AttributeError):
+            return -1
 
     def apply_devices(self):
         if self.settings_win is None:
@@ -2729,6 +3568,96 @@ class SoftphoneApp:
         except Exception as e:
             logging.error("Erro ao aplicar dispositivos: %s", e)
             messagebox.showerror("Erro", f"Falha ao aplicar dispositivos: {e}")
+
+    def apply_camera(self):
+        cam = self._selected_camera()
+        if cam < 0:
+            messagebox.showinfo(
+                "Câmera", "Selecione uma câmera na lista acima.", parent=self.video_win
+            )
+            return
+        if cam != (self.config_data.get("video") or {}).get("device", -1):
+            video = self.config_data.setdefault("video", {})
+            video["device"] = cam
+            save_config(self.config_data)
+            logging.info("Câmera salva: %s", cam)
+            self._apply_camera_to_accounts(cam)
+        messagebox.showinfo("Câmera", f"Câmera {cam} aplicada.", parent=self.video_win)
+
+    def _apply_camera_to_accounts(self, dev):
+        if self.current_call is not None or self.call_state != "IDLE":
+            logging.info("Câmera %s salva; aplicará nas próximas chamadas", dev)
+            return
+        try:
+            for entry in list(self.accounts):
+                acc = entry.get("acc")
+                if acc is not None:
+                    try:
+                        acc.shutdown()
+                    except Exception:
+                        pass
+            self.accounts = []
+            self.update_presence()
+            for a in self.config_data.get("accounts", []):
+                self.register_account(a)
+            logging.info("Contas re-registradas com a câmera %s", dev)
+        except Exception as e:
+            logging.error("Erro ao re-registrar contas: %s", e)
+
+    def _toggle_preview(self):
+        if self._preview is not None:
+            self._stop_preview()
+            return
+        dev = self._selected_camera()
+        if dev < 0:
+            messagebox.showinfo(
+                "Prévia", "Selecione uma câmera na lista acima.", parent=self.video_win
+            )
+            return
+        frame = self.video_preview_frame
+        if frame is None or not frame.winfo_exists():
+            return
+        try:
+            frame.update_idletasks()
+            xid = frame.winfo_id()
+            prm = pj.VideoPreviewOpParam()
+            prm.show = True
+            prm.window = _native_video_handle(xid)
+            self._preview = pj.VideoPreview(dev)
+            self._preview.start(prm)
+            self.video_preview_label.pack_forget()
+            self.btn_video_preview.config(text="Atualizar prévia")
+            logging.info("Prévia da câmera %s iniciada", dev)
+        except Exception as e:
+            self._preview = None
+            self.video_preview_label.pack(expand=True, fill=tk.BOTH)
+            self.video_preview_label.config(text="Prévia indisponível")
+            messagebox.showerror(
+                "Prévia", f"Não foi possível iniciar a prévia da câmera:\n{e}",
+                parent=self.video_win,
+            )
+
+    def _stop_preview(self):
+        preview = self._preview
+        self._preview = None
+        if preview is not None:
+            try:
+                preview.stop()
+            except Exception as e:
+                logging.warning("Erro ao parar a prévia: %s", e)
+        if self.video_preview_frame is not None:
+            try:
+                if self.video_preview_frame.winfo_exists():
+                    self.video_preview_frame.configure(bg="black")
+                    self.video_preview_label.config(text="Prévia desligada")
+                    self.video_preview_label.pack(expand=True, fill=tk.BOTH)
+            except Exception:
+                pass
+        if hasattr(self, "btn_video_preview"):
+            try:
+                self.btn_video_preview.config(text="Ver prévia")
+            except Exception:
+                pass
 
     # =========================
     # LOOP / ENCERRAMENTO
@@ -2769,6 +3698,14 @@ class SoftphoneApp:
             self._stop_ringback()
             self._stop_ringtone()
             self._stop_test_player()
+            self._stop_preview()
+            self._teardown_conference()
+            if self.video_win is not None:
+                try:
+                    self.video_win.destroy()
+                except Exception:
+                    pass
+                self.video_win = None
             self.calls.clear()
             for entry in self.accounts:
                 try:
