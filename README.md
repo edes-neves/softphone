@@ -5,6 +5,85 @@ Tkinter. Suporta múltiplas contas SIP, registro automático, chamadas de saída
 chamadas de entrada (atender/recusar), mute, controle de volume e seleção de
 dispositivos de áudio.
 
+## Estrutura do código
+
+O projeto agora é um pacote `voice_neves/` (a aplicação monolítica
+`softphone.py` virou um lançador fino). A camada de **lógica pura** foi separada
+e é testável sem `tkinter` nem `pjsua2`:
+
+| Módulo                       | Responsabilidade                                            |
+| ---------------------------- | ----------------------------------------------------------- |
+| `voice_neves/constants.py`   | Caminhos XDG, regex, versão, codecs, fontes (`__all__`)     |
+| `voice_neves/themes.py`      | Paletas claro/escuro (somente dados)                        |
+| `voice_neves/utils.py`       | `clean_extension`, validação, `build_sip_target`, logging   |
+| `voice_neves/config.py`      | Carregar/salvar/normalizar `config.json` (migração legada)  |
+| `voice_neves/history.py`    | Histórico de chamadas (I/O JSON)                            |
+| `voice_neves/secrets_store.py` | Cofre de senhas (keyring + fallback `0600`)                |
+| `voice_neves/contacts_store.py` | Contatos locais (`contacts.json`)                        |
+| `voice_neves/ldap_manager.py` | Agenda corporativa LDAP com cache (opcional)                |
+| `voice_neves/pjsip_models.py` | Wrappers pjsua2: `MyAccount`/`MyBuddy`/`MyCall`            |
+| `voice_neves/runtime.py`    | Singleton do cofre de senhas                                |
+| `voice_neves/app.py`         | UI (tkinter) + controlador `SoftphoneApp` + globais de cor   |
+| `voice_neves/__main__.py`    | Ponto de entrada (`main()`)                                 |
+
+As globais mutáveis de cor (`COLOR_*`) permanecem no `app.py` (mesmo módulo da
+UI), preservando o `set_theme()` do original.
+
+## Testes e CI
+
+```bash
+pip install pytest pytest-cov
+python -m pytest tests -q
+python -m pytest tests --cov=voice_neves --cov-report=term-missing
+```
+
+Os testes cobrem a camada pura (constants, themes, utils, config, history,
+secrets_store, contacts_store, platform, sip_backend) e pulam
+`pjsip_models`/`app` quando `pjsua2` ou display não estão disponíveis. O CI
+(`.github/workflows/ci.yml`) roda em Python 3.11–3.14: lint, smoke-import da
+camada pura e pytest; há job extra para Windows e macOS validando que o app
+carrega (sem pjsua2) e os testes da camada pura passam.
+
+## Suporte multi-plataforma (cross-platform)
+
+O app é **multi-plataforma na camada de UI e lógica pura**:
+
+- **Linux**: funcionalidade completa, including G.729/BCG729, ZRTP, vídeo, LDAP.
+- **Windows e macOS**: o app abre, configura contas, edita contatos/histórico,
+  aplica tema claro/escuro e persiste config/contatos/histórico. **Chamadas SIP
+  ficam desativadas** — ao tentar ligar, mostra *"Backend SIP indisponível
+  neste sistema"* e o status exibe *"Backend SIP indisponível"*.
+
+Por quê? O `pjsua2` é uma **binding C++ SWIG** do PJSIP — o binário produzido é
+`.so` (ELF Linux) e não carrega em `.pyd` (Windows) nem `.dylib` (macOS). O
+G.729 grátis (BCG729) está compilado dentro de `libpjmedia-codec.so`. Para
+chamadas reais em Win/Mac seria preciso (a) cross-compile do pjsua2 com
+BCG729 (grande esforço, risco de perda do codec) ou (b) outro backend SIP
+(pip-installável, ex.: `linphone-sdk` — alternativo, sem G.729).
+
+**Ganchos para o futuro** (já prontos, sem work extra):
+
+- `voice_neves/sip_backend.py` — probe de disponibilidade (`import_pjsua2()`).
+- `voice_neves/platform.py` — paths/notifica/diretório de música por SO.
+- `app.py` — todo fluxo que usa `pj.*` está travado por `if self._sip_available`,
+  `if self.endpoint is None`, etc. Plugar um novo backend futuramente só pede
+  implementar `import_pjsua2()` para devolvê-lo.
+
+Paths por SO (respeitando convenção nativa):
+
+| SO       | Config                                              | Dados                                              |
+| -------- | --------------------------------------------------- | -------------------------------------------------- |
+| Linux    | `~/.config/softphone` (ou `$XDG_CONFIG_HOME/...`)   | `~/.local/share/softphone` (ou `$XDG_DATA_HOME`)  |
+| macOS    | `~/Library/Application Support/softphone`           | igual ao de config                                 |
+| Windows  | `%APPDATA%\softphone`                               | `%LOCALAPPDATA%\softphone`                         |
+
+Notificações: `notify-send` (Linux), `osascript display notification` (macOS),
+log (Windows — toast real via pywin32/winrt fica como gancho futuro).
+
+Gravações de chamada: `~/Music/VoiceNeves` em qualquer SO (ou
+`$XDG_MUSIC_HOME` no Linux), em vez do antigo `~/Música/...` que quebrava em
+locais não-pt-BR.
+
 ## Dependências
 
 - **Python 3.14+** (com Tkinter)

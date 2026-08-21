@@ -5,5 +5,14 @@ pyinstaller>=6.0
 # Opcional: sem keyring o app usa um arquivo local com permissão 0600.
 keyring>=24.0
 
+# Bandeja do sistema + ícone
+# Opcional: sem pystray/Pillow o app roda sem bandeja.
+pystray>=0.19
+Pillow>=10.0
+
+# Hotkeys globais (F9=Atender, F10=Desligar, F11=Mute)
+# Opcional: sem pynput as hotkeys ficam desativadas.
+pynput>=1.7
+
 # NOTA: pjsua2 (PJSIP) não é distribuído via pip. Instale compilando o PJSIP
 # ou copiando o pacote .egg/so do sistema. Ver README.md.

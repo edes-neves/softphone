@@ -9,6 +9,7 @@ dist/
 
 # Ambiente virtual
 venv/
+.venv/
 
 # Arquivos locais sensíveis
 *.log
@@ -17,6 +18,19 @@ sip_config.json
 # AppImage (artefato de build)
 *.AppImage
 
+# Artefatos e ferramentas binárias locais
+AppDir/
+VoiceNeves
+linuxdeploy*
+third_party/
+ZRTPCPP/
+voice_neves.appimage
+
 # Editor e temporários
 .vscode/
 tempCodeRunnerFile.py
+
+# Testes / cobertura
+.coverage
+htmlcov/
+.pytest_cache/

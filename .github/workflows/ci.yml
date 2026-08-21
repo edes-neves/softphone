@@ -1,0 +1,110 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  lint:
+    name: Lint (ruff)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.txt
+      - run: pip install ruff
+      - run: ruff check voice_neves tests
+
+  test-linux:
+    name: Testes Linux (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configurar Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Instalar dependências de teste
+        run: |
+          python -m pip install --upgrade pip
+          pip install pytest ruff
+          # keyring e demais do requirements sao opcionais para a camada pura
+          # (fallback automatico). pjsua2 nao e pip-installavel e nao e exigido
+          # pelos testes (test_pjsip_models faz skip se ausente).
+
+      - name: Compilar (byte-compile de tudo)
+        run: python -m compileall voice_neves softphone.py
+
+      - name: Importar camada pura (smoke)
+        run: |
+          python - <<'PY'
+          import voice_neves.constants, voice_neves.themes, voice_neves.utils
+          import voice_neves.config, voice_neves.history
+          import voice_neves.secrets_store, voice_neves.contacts_store
+          import voice_neves.ldap_manager, voice_neves.platform, voice_neves.sip_backend
+          print("camada pura importada OK")
+          print("backend label:", voice_neves.sip_backend.backend_label())
+          PY
+
+      - name: Rodar testes (pytest)
+        run: python -m pytest tests -q
+
+  # Job multi-OS: valida que a GUI/lógica pura carrega e os testes passam
+  # EM plataformas SEM pjsua2 (Win/Mac). Confirma que o app não trava na
+  # importação e que o sip_backend sinaliza "indisponível" corretamente.
+  test-cross-platform:
+    name: Testes ${{ matrix.os }} (sem pjsua2)
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+        python-version: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configurar Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Instalar dependências de teste
+        run: |
+          python -m pip install --upgrade pip
+          pip install pytest ruff
+
+      - name: Compilar (byte-compile de tudo)
+        run: python -m compileall voice_neves softphone.py
+
+      - name: Importar camada pura (smoke sem pjsua2)
+        run: |
+          python - <<'PY'
+          # Em Win/Mac pjsua2 não está instalado -- o import NÃO pode falhar.
+          import voice_neves.constants, voice_neves.themes, voice_neves.utils
+          import voice_neves.config, voice_neves.history
+          import voice_neves.secrets_store, voice_neves.contacts_store
+          import voice_neves.ldap_manager, voice_neves.platform, voice_neves.sip_backend
+          import voice_neves.pjsip_models as m
+          assert m._HAS_PJSUA2 is False, "em Win/Mac pjsua2 deve estar ausente"
+          assert m.MyAccount is None and m.MyBuddy is None and m.MyCall is None
+          assert voice_neves.sip_backend.pjsua2_available() is False
+          print("camada pura carrega em", __import__("sys").platform, "OK")
+          PY
+
+      - name: Rodar testes (pytest)
+        run: python -m pytest tests -q

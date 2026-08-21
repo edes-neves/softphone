@@ -1,22 +1,20 @@
 # -*- mode: python ; coding: utf-8 -*-
+from PyInstaller.utils.hooks import collect_data_files
+from PyInstaller.utils.hooks import collect_submodules
 
-import os
+datas = [('ringtone.wav', '.'), ('Icone.png', '.'), ('voiceneves.png', '.')]
+hiddenimports = ['pjsua2', 'pystray', 'pynput', 'PIL']
+datas += collect_data_files('keyring')
+hiddenimports += collect_submodules('voice_neves')
+hiddenimports += collect_submodules('keyring')
 
-from PyInstaller.utils.hooks import collect_data_files, collect_submodules
-
-# pjsua2 é compilado fora do pip e fica como egg no site-packages do sistema.
-PJSUA2_EGG = "/usr/local/lib/python3.14/dist-packages/pjsua2-2.14-py3.14-linux-x86_64.egg"
-PJSUA2_LIB = "/usr/local/lib"
 
 a = Analysis(
     ['softphone.py'],
-    pathex=[PJSUA2_EGG],
-    binaries=[
-        (os.path.join(PJSUA2_EGG, '_pjsua2.cpython-314-x86_64-linux-gnu.so'), '.'),
-        (os.path.join(PJSUA2_LIB, 'libpjsua2.so'), '.'),
-    ],
-    datas=collect_data_files('keyring') + [('ringtone.wav', '.'), ('Icone.png', '.')],
-    hiddenimports=['pjsua2'] + collect_submodules('keyring'),
+    pathex=['build/pjsua2_bundle'],
+    binaries=[('build/pjsua2_bundle/_pjsua2.cpython-312-x86_64-linux-gnu.so', '.'), ('build/pjsua2_bundle/lib*.so*', '.')],
+    datas=datas,
+    hiddenimports=hiddenimports,
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
@@ -36,7 +34,6 @@ exe = EXE(
     bootloader_ignore_signals=False,
     strip=False,
     upx=True,
-    upx_exclude=[],
     console=True,
     disable_windowed_traceback=False,
     argv_emulation=False,
