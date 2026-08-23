@@ -42,6 +42,8 @@ jobs:
           cp /tmp/assets/pjsip-lib/lib*.so* third_party/pjsip-dist/lib/
 
       - name: Validar import do pjsua2 (glibc/bibliotecas)
+        env:
+          LD_LIBRARY_PATH: ${{ github.workspace }}/third_party/pjsip-dist/lib
         run: .venv/bin/python -c "import pjsua2; assert pjsua2.PJSIP_INV_STATE_CONFIRMED is not None; print('pjsua2 OK')"
 
       - name: Baixar appimagetool
