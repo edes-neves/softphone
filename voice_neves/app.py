@@ -4883,8 +4883,13 @@ class SoftphoneApp:
             self._connect_call_media(call)
             self._update_zrtp_ui(call)
             if self.current_audio_media is not None and not self._call_is_confirmed(call):
-                self._stop_ringback(reason="mídia antecipada (early media)")
-                logging.info("Mídia antecipada ativa durante o chamado (early media); ringback parado")
+                # Mídia ativa antes do atendimento (183 com SDP) NÃO encerra
+                # mais o toque: operadoras enviam early media silencioso e o
+                # usuário precisa ouvir o ringback até o destino atender.
+                logging.info(
+                    "Mídia antecipada ativa antes do atendimento; "
+                    "toque local mantido até a chamada ser confirmada"
+                )
         self.update_call_ui()
 
     def _get_zrtp_state(self, call):
