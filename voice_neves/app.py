@@ -76,6 +76,40 @@ def pj_error_text(e):
     return str(e)
 
 
+# Faixa de erros PJMEDIA_AUDIODEV_ERRNO_START (420001..): falhas do
+# dispositivo de som (PJMEDIA_EAUD_*), ex.: ALSA não abre o "default".
+AUDIODEV_ERRNO_START = 420001
+AUDIODEV_ERRNO_END = 421000
+
+
+def is_audio_device_error(e):
+    """True se o erro do pjsua2 for falha ao abrir/usar dispositivo de som."""
+    if not isinstance(e, pj.Error):
+        return False
+    if AUDIODEV_ERRNO_START <= getattr(e, "status", 0) < AUDIODEV_ERRNO_END:
+        return True
+    reason = ""
+    try:
+        reason = (getattr(e, "reason", "") or "") + (getattr(e, "title", "") or "")
+    except Exception:
+        pass
+    return any(k in reason.lower() for k in ("sound device", "audiodev", "snd_dev"))
+
+
+def audio_error_hint(err_text=""):
+    """Dica acionável para falha de dispositivo de áudio (PipeWire/ALSA)."""
+    return (
+        "O PJSIP usa a pilha ALSA da distribuição, que normalmente é um "
+        "redirecionamento para PipeWire/PulseAudio.\n"
+        "Em distros Arch-based (BigLinux, Manjaro...) verifique:\n"
+        "  1. sudo pacman -S pipewire-alsa alsa-plugins alsa-utils\n"
+        "  2. Teste fora do app: arecord -D default -f cd /dev/null e "
+        "aplay -D default /dev/null\n"
+        "  3. Em Configurações > Áudio, escolha outro dispositivo de "
+        "captura/reprodução."
+    )
+
+
 
 COLOR_BG = THEMES["light"]["bg"]
 COLOR_CARD = THEMES["light"]["card"]
@@ -799,6 +833,16 @@ class SoftphoneApp:
         self._setup_hotkeys()
         self._start_theme_watcher()
         self.root.after(50, self.loop)
+        if getattr(self, "_audio_warning", None):
+            self.root.after(1200, self._show_audio_warning)
+
+    def _show_audio_warning(self):
+        """Aviso pós-boot quando a sondagem de áudio falhou na inicialização."""
+        if not getattr(self, "_audio_warning", None):
+            return
+        logging.warning("Aviso de áudio ao usuário: %s", self._audio_warning)
+        messagebox.showwarning("Problema de áudio detectado", self._audio_warning)
+        self._audio_warning = None
 
     # =========================
     # PJSIP
@@ -848,24 +892,98 @@ class SoftphoneApp:
         self._detect_video_support()
         self._detect_audio_support()
 
-    def _detect_audio_support(self):
+    def _try_open_sound(self, capture_dev, playback_dev):
+        """Abre imediatamente o par cap/play (mesmo fluxo do makeCall do pjsua2).
+
+        Retorna None em sucesso ou o texto do erro. Usa setSndDevMode(0) para
+        forçar abertura imediata: setCaptureDev/setPlaybackDev sozinhos marcam
+        PJSUA_SND_DEV_NO_IMMEDIATE_OPEN e NÃO testam a abertura real.
+        """
         try:
-            count = len(self.endpoint.audDevManager().enumDev2())
+            adm = self.endpoint.audDevManager()
+            adm.setCaptureDev(capture_dev)
+            adm.setPlaybackDev(playback_dev)
+            adm.setSndDevMode(0)
+            return None
         except Exception as e:
-            count = 0
+            return pj_error_text(e)
+
+    def _detect_audio_support(self):
+        self._has_audio = False
+        self._audio_warning = None
+        try:
+            devs = list(self.endpoint.audDevManager().enumDev2())
+        except Exception as e:
+            devs = []
             logging.error("Não foi possível enumerar dispositivos de áudio: %s", e)
-        self._has_audio = count > 0
-        if not self._has_audio:
+
+        if not devs:
             logging.critical(
-                "NENHUM dispositivo de áudio PJSIP disponível (%d). As chamadas vão "
-                "falhar com PJMEDIA_EAUD_NODEFDEV, o toque não toca e a chamada fica "
-                "muda. Causa provável: o pjsua2 em uso foi compilado SEM backend de "
-                "áudio (ALSA/PulseAudio). Verifique o pjsua2 carregado por "
-                "`import pjsua2; print(pjsua2.__file__)` e use um build com ALSA.",
-                count,
+                "NENHUM dispositivo de áudio PJSIP disponível (0). O toque não toca "
+                "e as chamadas ficam mudas. Causa provável: pjsua2 compilado sem "
+                "backend de áudio (ALSA/PulseAudio) ou ALSA sem dispositivos visíveis."
             )
-        else:
-            logging.info("PJSUA detectou %d dispositivo(s) de áudio", count)
+            self._audio_warning = (
+                "Nenhum dispositivo de áudio foi encontrado pelo PJSIP.\n"
+                "As chamadas vão conectar SEM SOM."
+            )
+            return
+
+        # Sondagem ativa do par padrão (-1/-2). Enumerar não basta: em distros
+        # Arch-based (ex.: BigLinux) o mapeamento ALSA "default" -> PipeWire pode
+        # estar quebrado mesmo listando dispositivos. O makeCall do pjsua2 abre
+        # o som ANTES de enviar o INVITE (pjsua_call_make_call -> pjsua_set_snd_dev)
+        # e falha na hora com erro apontando para src/pjsua2/call.cpp.
+        err = self._try_open_sound(-1, -2)
+        if err is None:
+            self._has_audio = True
+            logging.info(
+                "PJSUA abriu o dispositivo padrão de áudio (%d disponíveis)", len(devs)
+            )
+            return
+
+        logging.warning(
+            "Dispositivo de áudio PADRÃO não abriu (%s). Tentando alternativos...", err
+        )
+
+        # Fallback 1: dispositivos duplex; Fallback 2: pares captura x playback.
+        duplex = [i for i, d in enumerate(devs) if d.inputCount > 0 and d.outputCount > 0]
+        caps = [i for i, d in enumerate(devs) if d.inputCount > 0]
+        plays = [i for i, d in enumerate(devs) if d.outputCount > 0]
+        candidates = [(i, i) for i in duplex]
+        candidates += [(c, p) for c in caps for p in plays if c != p]
+
+        last_err = err
+        for cap_id, play_id in candidates:
+            last_err = self._try_open_sound(cap_id, play_id)
+            if last_err is None:
+                self._has_audio = True
+                logging.warning(
+                    "Áudio funcionando com dispositivo alternativo: captura=%d ('%s'), "
+                    "playback=%d ('%s')",
+                    cap_id,
+                    devs[cap_id].name,
+                    play_id,
+                    devs[play_id].name,
+                )
+                return
+
+        # Nada abriu: usa dispositivo nulo para as chamadas ainda conectarem
+        # (sem som) em vez do makeCall estourar erro em call.cpp.
+        try:
+            self.endpoint.audDevManager().setNullDev()
+        except Exception as e:
+            logging.error("Falha ao ativar dispositivo de áudio nulo: %s", e)
+        hint = audio_error_hint(last_err)
+        self._audio_warning = (
+            "Não foi possível abrir nenhum dispositivo de áudio.\n"
+            "As chamadas vão conectar SEM SOM.\n\n" + hint + f"\n\nÚltimo erro: {last_err}"
+        )
+        logging.critical(
+            "NENHUM dispositivo de áudio pôde ser aberto. Chamadas ficarão mudas. "
+            "Último erro: %s",
+            last_err,
+        )
 
     def _detect_video_support(self):
         try:
@@ -3759,7 +3877,10 @@ class SoftphoneApp:
         except Exception as e:
             self.current_call = None
             logging.error("Erro ao ligar: %s", pj_error_text(e))
-            messagebox.showerror("Erro", f"Falha ao ligar: {pj_error_text(e)}")
+            msg = f"Falha ao ligar: {pj_error_text(e)}"
+            if is_audio_device_error(e):
+                msg += "\n\n" + audio_error_hint()
+            messagebox.showerror("Erro", msg)
 
     def on_incoming(self, call):
         self._track_call(call)
@@ -3890,7 +4011,10 @@ class SoftphoneApp:
             self.update_call_ui()
         except Exception as e:
             logging.error("Erro ao atender: %s", pj_error_text(e))
-            messagebox.showerror("Erro", f"Falha ao atender: {pj_error_text(e)}")
+            msg = f"Falha ao atender: {pj_error_text(e)}"
+            if is_audio_device_error(e):
+                msg += "\n\n" + audio_error_hint()
+            messagebox.showerror("Erro", msg)
 
     def hangup(self):
         if self.recording:
