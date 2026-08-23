@@ -188,6 +188,44 @@ etc.).
 - Codec G.729 (grátis) via BCG729, embutido estaticamente no `libpjmedia-codec.so`
 - Logs detalhados em arquivo (`app.log`)
 
+## Solução de problemas (áudio)
+
+### BigLinux / Manjaro / Arch-based: chamadas mudas ou erro ao ligar
+
+**Sintomas**: chamadas recebidas conectam sem som e, ao originar chamada,
+aparece erro do pjsua2 apontando para `src/pjsua2/call.cpp` (`makeCall`).
+
+**Causa**: o PJSIP usa a pilha ALSA da distribuição, que no BigLinux é um
+redirecionamento para o PipeWire. Se o mapeamento ALSA→PipeWire não estiver
+instalado/configurado, o PJSIP não consegue abrir o dispositivo `default`
+(o app abre o dispositivo de som **antes** de enviar o INVITE).
+
+**Correção no sistema** (uma vez só, requer reiniciar o Voice Neves depois):
+
+```bash
+sudo pacman -S pipewire-alsa alsa-plugins alsa-utils
+```
+
+Teste fora do app (ambos devem rodar sem erro — use Ctrl+C para encerrar):
+
+```bash
+arecord -D default -f cd /dev/null
+aplay -D default /dev/null
+```
+
+**A partir da v1.0.2**, o app detecta esse problema na inicialização: tenta
+abrir o dispositivo padrão, faz fallback automático para outro dispositivo que
+funcione e, se nada abrir, avisa na tela em vez de falhar silenciosamente
+na hora da chamada.
+
+Se persistir, verifique também:
+
+1. Em **Configurações → Áudio**, escolha outro dispositivo de captura/reprodução.
+2. Confirme que o PipeWire está saudável: `wpctl status`.
+3. Envie o log do PJSIP (`~/.local/share/softphone/pjsua.log`) ao suporte.
+
+No Ubuntu 22.04–26.04 não é necessário nenhum passo extra.
+
 ## Suporte a G.729 (BCG729)
 
 O codec G.729 (8 kbit/s) é patenteado — o PJSIP não o inclui por padrão. Este
