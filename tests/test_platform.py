@@ -6,7 +6,6 @@ são simulados via monkeypatch de sys.platform / os.name.
 """
 import os
 
-import pytest
 
 from voice_neves import platform
 

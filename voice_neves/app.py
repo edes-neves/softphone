@@ -7,7 +7,6 @@ logica pura (config, historico, contatos, secrets, ldap, modelos pjsip) vive
 em modulos separados do pacote voice_neves.
 """
 import os
-import sys
 import csv
 import json
 import re
@@ -45,7 +44,7 @@ except Exception:
     HAVE_HOTKEYS = False
 
 from .constants import *  # noqa: F401,F403  (APP_*, paths, regex, codecs, STATE_LABELS, COLOR_OFFLINE)
-from .constants import CONFIG_DIR, DATA_DIR  # explicitas (usadas por tooling)
+from .constants import DATA_DIR  # explicitas (usadas por tooling)
 from .themes import THEMES
 from .platform import detect_system_theme
 from .runtime import secrets

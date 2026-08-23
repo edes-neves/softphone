@@ -29,7 +29,7 @@ def test_default_config_shape():
     sec = FakeSecrets()
     cfg = config._default_config(sec)
     assert cfg["accounts"] == []
-    assert cfg["theme"] == "light"
+    assert cfg["theme"] == "auto"
     assert cfg["auto_answer"] is False
     assert "codecs" in cfg and "audio" in cfg["codecs"]
     assert cfg["security"]["srtp"] == "disabled"
@@ -116,7 +116,7 @@ def test_load_config_missing_returns_default(tmp_path, monkeypatch):
     sec = FakeSecrets()
     cfg = config.load_config(sec)
     assert cfg["accounts"] == []
-    assert cfg["theme"] in ("light", "dark")
+    assert cfg["theme"] == "auto"
 
 
 def test_migrate_legacy_config(tmp_path, monkeypatch):

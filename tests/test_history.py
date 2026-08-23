@@ -1,4 +1,3 @@
-import os
 
 from voice_neves import history
 

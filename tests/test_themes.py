@@ -18,4 +18,4 @@ def test_themes_values_are_hex():
 
 def test_themes_specific_colors():
     assert THEMES["light"]["bg"] == "#F8FAFC"
-    assert THEMES["dark"]["bg"] == "#0F172A"
+    assert THEMES["dark"]["bg"] == "#161A23"

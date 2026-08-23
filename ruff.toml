@@ -1,0 +1,24 @@
+# Configuração do ruff (lint) — regras essenciais que o código segue hoje.
+# O estilo do projeto usa try/except amplos, logging pela raiz e
+# `from .constants import *`; regras opinativas sobre esses padrões ficam
+# fora do select para o lint sinalizar apenas problemas reais.
+target-version = "py312"
+line-length = 100
+
+[lint]
+select = [
+    "E4",  # pycodestyle: imports/indentação quebrada
+    "E7",  # pycodestyle: statements inválidos
+    "E9",  # pycodestyle: erros de sintaxe/runtime
+    "F",   # pyflakes: nomes indefinidos, imports não usados
+    "W",   # whitespace
+]
+ignore = [
+    "F403", # `from .constants import *` é padrão do projeto
+    "F405", # nomes vindos de import * (constants)
+    "E402", # imports condicionais no topo do app.py (fallbacks opcionais)
+]
+
+[lint.per-file-ignores]
+# Nenhum por enquanto; reservado para exceções futuras de testes.
+

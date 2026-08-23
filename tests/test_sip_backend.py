@@ -2,7 +2,6 @@
 import importlib
 import sys
 
-import pytest
 
 from voice_neves import sip_backend
 
