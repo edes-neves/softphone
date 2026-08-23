@@ -15,7 +15,7 @@ __all__ = [
 ]
 
 APP_NAME = "Voice Neves"
-APP_VERSION = "1.0.1"
+APP_VERSION = "1.0.2"
 APP_DEV = "José Edes Neves"
 APP_UPDATED = "08/2026"
 CONTACT_EMAIL = "nevestecnologias@gmail.com"
