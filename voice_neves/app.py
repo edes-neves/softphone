@@ -4034,7 +4034,7 @@ class SoftphoneApp:
             except Exception as e:
                 logging.error("Erro ao desligar: %s", pj_error_text(e))
 
-        self._stop_ringback()
+        self._stop_ringback(reason="desligar")
         self.set_call_state("IDLE")
         self.update_call_ui()
 
@@ -4069,7 +4069,7 @@ class SoftphoneApp:
             # o CONFIRMED da perna em espera (re-INVITE do hold) não deve
             # matar o toque da chamada nova.
             if call is self.current_call:
-                self._stop_ringback()
+                self._stop_ringback(reason="chamada atual confirmada")
             if self._pending_xfer is not None and self._pending_xfer.get("dst") is call:
                 self._complete_attended_xfer(call)
             elif self.conf_active:
@@ -4228,6 +4228,10 @@ class SoftphoneApp:
             self._start_ringback()
             self.set_call_state("CALLING")
         elif state == pj.PJSIP_INV_STATE_EARLY:
+            # Reativa o toque se ele foi parado por um evento alheio (ex.:
+            # queda da perna em espera) enquanto esta chamada ainda toca.
+            if not self._call_is_confirmed(call):
+                self._start_ringback()
             self.set_call_state("RINGING")
         self.update_call_ui()
 
@@ -4244,7 +4248,11 @@ class SoftphoneApp:
         self._finalize_history_entry(call)
         self._forget_call(call)
         self._remove_leg_from_conference(call)
-        self._stop_ringback()
+        # Só cessa o ringback se quem caiu é a chamada ativa/tocando; a queda
+        # da perna em espera (ex.: re-INVITE de hold recusado pelo PBX) não
+        # pode silenciar o toque da chamada nova que ainda está chamando.
+        if call is self.current_call:
+            self._stop_ringback(reason="chamada atual encerrada")
         nxt = self._pick_other_call(exclude=call)
         if nxt is not None:
             self._activate_call(nxt)
@@ -4875,7 +4883,7 @@ class SoftphoneApp:
             self._connect_call_media(call)
             self._update_zrtp_ui(call)
             if self.current_audio_media is not None and not self._call_is_confirmed(call):
-                self._stop_ringback()
+                self._stop_ringback(reason="mídia antecipada (early media)")
                 logging.info("Mídia antecipada ativa durante o chamado (early media); ringback parado")
         self.update_call_ui()
 
@@ -5350,9 +5358,11 @@ class SoftphoneApp:
             self._ringback = None
             logging.error("Erro ao tocar ringback: %s", e)
 
-    def _stop_ringback(self):
+    def _stop_ringback(self, reason=""):
         if self._ringback is None:
             return
+        if reason:
+            logging.info("Parando ringback: %s", reason)
         try:
             spk = self.endpoint.audDevManager().getPlaybackDevMedia()
             self._ringback.stopTransmit(spk)
@@ -6167,7 +6177,7 @@ class SoftphoneApp:
                     pass
                 self._tray_icon = None
             self._close_transfer_win()
-            self._stop_ringback()
+            self._stop_ringback(reason="aplicativo encerrando")
             self._stop_ringtone()
             self._stop_test_player()
             self._stop_preview()
