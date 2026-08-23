@@ -23,7 +23,13 @@ jobs:
       - name: Instalar dependências de build
         run: |
           sudo apt-get update
-          sudo apt-get install -y patchelf
+          # patchelf: rpath do bundle pjsua2. Demais pacotes: dependências
+          # diretas das libs PJSIP (áudio/vídeo/codecs/TLS) que um desktop
+          # Linux tem; o apt resolve as transitivas.
+          sudo apt-get install -y patchelf \
+            libasound2 libavcodec-extra58 libavutil56 libbcg729-0 \
+            libopenh264-6 libopus0 libsdl2-2.0-0 libssl3 libswscale5 \
+            libuuid1 libv4l-0 libvpx7
           python -m venv .venv
           .venv/bin/pip install -r requirements.txt
 
