@@ -49,6 +49,7 @@ jobs:
         run: python -m compileall voice_neves softphone.py
 
       - name: Importar camada pura (smoke)
+        shell: bash
         run: |
           python - <<'PY'
           import voice_neves.constants, voice_neves.themes, voice_neves.utils
@@ -92,6 +93,7 @@ jobs:
         run: python -m compileall voice_neves softphone.py
 
       - name: Importar camada pura (smoke sem pjsua2)
+        shell: bash
         run: |
           python - <<'PY'
           # Em Win/Mac pjsua2 não está instalado -- o import NÃO pode falhar.
