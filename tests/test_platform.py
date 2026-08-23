@@ -6,11 +6,18 @@ são simulados via monkeypatch de sys.platform / os.name.
 """
 import os
 
+import pytest
 
 from voice_neves import platform
 
+# Os ramos POSIX/XDG dependem do os.name REAL da maquina: monkeypatch de
+# sys.platform nao desvia o caminho no Windows. Esses testes rodam de fato
+# no Linux (e no CI Linux); no Windows sao irrelevantes.
+posix_only = pytest.mark.skipif(os.name == "nt", reason="comportamento XDG/POSIX")
+
 # ---------------- config_dir ----------------
 
+@posix_only
 def test_config_dir_linux_xdg_default(monkeypatch, tmp_path):
     monkeypatch.setattr(platform.sys, "platform", "linux")
     monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
@@ -18,6 +25,7 @@ def test_config_dir_linux_xdg_default(monkeypatch, tmp_path):
     assert p.endswith(".config/softphone")
 
 
+@posix_only
 def test_config_dir_linux_xdg_env(monkeypatch):
     monkeypatch.setattr(platform.sys, "platform", "linux")
     monkeypatch.setenv("XDG_CONFIG_HOME", "/custom/cfg")
@@ -50,6 +58,7 @@ def test_config_dir_windows_fallback(monkeypatch):
 
 # ---------------- data_dir ----------------
 
+@posix_only
 def test_data_dir_linux_default(monkeypatch):
     monkeypatch.setattr(platform.sys, "platform", "linux")
     monkeypatch.delenv("XDG_DATA_HOME", raising=False)
@@ -73,6 +82,7 @@ def test_data_dir_windows_localappdata(monkeypatch):
 
 # ---------------- music_dir ----------------
 
+@posix_only
 def test_music_dir_linux_xdg_env(monkeypatch):
     monkeypatch.setattr(platform.sys, "platform", "linux")
     monkeypatch.setenv("XDG_MUSIC_HOME", "/home/mus")
@@ -142,6 +152,7 @@ def test_notify_send_linux_missing_binary(monkeypatch, caplog):
 
 # ---------------- regressão Linux idêntico ao original ----------------
 
+@posix_only
 def test_linux_constants_path_unchanged(monkeypatch):
     """Em Linux (sem XDG_* env), os paths devem bater com os do original."""
     monkeypatch.setattr(platform.sys, "platform", "linux")

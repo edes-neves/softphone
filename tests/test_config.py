@@ -106,8 +106,9 @@ def test_save_and_load_config_roundtrip(tmp_path, monkeypatch):
     assert [a["user"] for a in loaded["accounts"]] == ["100"]
     assert loaded["auto_answer"] is True
     assert loaded["accounts"][0]["forward_no_answer_timeout"] == 15
-    # permissao 0600
-    assert (os.stat(config.CONFIG_FILE).st_mode & 0o777) == 0o600
+    # permissao 0600 (verificacao que so existe em POSIX)
+    if os.name == "posix":
+        assert (os.stat(config.CONFIG_FILE).st_mode & 0o777) == 0o600
 
 
 def test_load_config_missing_returns_default(tmp_path, monkeypatch):
@@ -148,6 +149,7 @@ def test_secrets_store_fallback_roundtrip(tmp_path):
     sec2 = SecretsStore(service="test_softphone", fallback_file=str(tmp_path / "sec.json"))
     sec2._keyring = None
     assert sec2.get("k") == "v"
-    assert (os.stat(tmp_path / "sec.json").st_mode & 0o777) == 0o600
+    if os.name == "posix":
+        assert (os.stat(tmp_path / "sec.json").st_mode & 0o777) == 0o600
     sec.delete("k")
     assert sec.get("k", "gone") == "gone"
