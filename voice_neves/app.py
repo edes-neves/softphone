@@ -1904,8 +1904,24 @@ class SoftphoneApp(QMainWindow):
 
     def _apply_nat_config(self, acfg):
         nat = self.config_data.get("nat") or {}
+        nc = acfg.natConfig
+        # Keep-Alive UDP: envia CRLF periódico no transporte para manter o
+        # mapeamento NAT/firewall aberto. Essencial p/ receber chamadas quando
+        # o app está atrás de NAT/firewall (binding expirava -> "ocupado").
         try:
-            acfg.natConfig.iceEnabled = bool(nat.get("ice"))
+            nc.udpKaIntervalSec = 15
+        except Exception as e:
+            logging.warning("Não foi possível configurar keep-alive UDP: %s", e)
+        # Reescreve Contact/Via/SDP com o endereço detectado (NAT), para o
+        # servidor/PBX conseguir rotear o áudio e o INVITE de volta até o app.
+        try:
+            nc.contactRewriteUse = True
+            nc.viaRewriteUse = True
+            nc.sdpNatRewriteUse = True
+        except Exception as e:
+            logging.warning("Não foi possível configurar o rewrite de NAT: %s", e)
+        try:
+            nc.iceEnabled = bool(nat.get("ice"))
         except Exception as e:
             logging.warning("Não foi possível ativar ICE: %s", e)
         if nat.get("turn_enabled") and str(nat.get("turn_server") or ""):
