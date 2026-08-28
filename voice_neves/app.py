@@ -133,6 +133,8 @@ COLOR_KEYPAD_BG = THEMES["light"]["keypad_bg"]
 COLOR_KEYPAD_FG = THEMES["light"]["keypad_fg"]
 COLOR_TOOLTIP_BG = THEMES["light"]["tooltip_bg"]
 COLOR_TOOLTIP_FG = THEMES["light"]["tooltip_fg"]
+COLOR_BTN_DISABLED_BG = THEMES["light"]["btn_disabled_bg"]
+COLOR_BTN_DISABLED_FG = THEMES["light"]["btn_disabled_fg"]
 
 _ACTIVE_THEME = "light"
 
@@ -147,6 +149,7 @@ def set_theme(name):
     global COLOR_TEXT, COLOR_MUTED, COLOR_LIST_EVEN, COLOR_LIST_ODD
     global COLOR_HEADER, COLOR_HEADER_CHIP, COLOR_KEYPAD_BG, COLOR_KEYPAD_FG
     global COLOR_TOOLTIP_BG, COLOR_TOOLTIP_FG, _ACTIVE_THEME
+    global COLOR_BTN_DISABLED_BG, COLOR_BTN_DISABLED_FG
     key = name if name in THEMES else detect_system_theme()
     if key not in THEMES:
         key = "light"
@@ -166,6 +169,8 @@ def set_theme(name):
     COLOR_KEYPAD_FG = t["keypad_fg"]
     COLOR_TOOLTIP_BG = t["tooltip_bg"]
     COLOR_TOOLTIP_FG = t["tooltip_fg"]
+    COLOR_BTN_DISABLED_BG = t["btn_disabled_bg"]
+    COLOR_BTN_DISABLED_FG = t["btn_disabled_fg"]
     STATUS_COLORS.update(
         {
             "IDLE": COLOR_SUCCESS,
@@ -375,7 +380,7 @@ class RoundedButton(QPushButton):
 
     def _apply_style(self):
         if self._disabled:
-            bg, fg = COLOR_BORDER, COLOR_MUTED
+            bg, fg = COLOR_BTN_DISABLED_BG, COLOR_BTN_DISABLED_FG
         else:
             bg, fg = self._bg, self._fg
         c = "background: %s; color: %s; border-radius: 12px; border: none; padding: 8px 12px; font-weight: 600;" % (
