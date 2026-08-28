@@ -50,7 +50,11 @@ def test_download_to_temp_and_checksum(monkeypatch, tmp_path):
             return False
 
         def read(self, n):
-            return content
+            # Garante EOF: responde o conteúdo uma vez e depois b"" para o loop
+            # de download de updater.download_to_temp terminar.
+            data = self._buf[:n]
+            self._buf = self._buf[n:]
+            return data
 
     class FakeReq:
         def __init__(self, *a, **k):
@@ -59,8 +63,11 @@ def test_download_to_temp_and_checksum(monkeypatch, tmp_path):
         def add_header(self, *a):
             pass
 
+    resp = FakeResp()
+    resp._buf = content
+
     def fake_urlopen(req, timeout=10):
-        return FakeResp()
+        return resp
 
     monkeypatch.setattr(updater.urllib.request, "urlopen", fake_urlopen)
     monkeypatch.setattr(updater.urllib.request, "Request", FakeReq)
