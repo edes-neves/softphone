@@ -330,6 +330,23 @@ def _shadow(widget, blur=24, dy=4):
     return widget
 
 
+def _decorate_window(win, maximize=True):
+    """Garante os botões padrão da janela (minimizar/maximizar/fechar).
+
+    QDialogs costumam abrir com apenas o botão fechar em alguns gerenciadores
+    de janela (Linux); aqui somamos os hints de min/max aos já existentes, sem
+    remover os flags atuais (preserva modalidade/primeiro plano quando houver).
+    """
+    win.setWindowFlags(
+        win.windowFlags()
+        | Qt.WindowType.WindowSystemMenuHint
+        | Qt.WindowType.WindowMinimizeButtonHint
+        | Qt.WindowType.WindowCloseButtonHint
+        | (Qt.WindowType.WindowMaximizeButtonHint if maximize else Qt.WindowType())
+    )
+    return win
+
+
 # =========================
 # BOTÃO ARREDONDADO (QPushButton estilizado)
 # =========================
@@ -357,10 +374,13 @@ class RoundedButton(QPushButton):
         self._apply_style()
 
     def _apply_style(self):
-        c = "background: %s; color: %s; border-radius: %dpx; border: none; padding: 8px 12px; font-weight: 600;" % (
-            COLOR_MUTED if self._disabled else self._bg,
-            self._fg if not self._disabled else COLOR_MUTED,
-            12,
+        if self._disabled:
+            bg, fg = COLOR_BORDER, COLOR_MUTED
+        else:
+            bg, fg = self._bg, self._fg
+        c = "background: %s; color: %s; border-radius: 12px; border: none; padding: 8px 12px; font-weight: 600;" % (
+            bg,
+            fg,
         )
         self.setStyleSheet(c)
 
@@ -623,6 +643,7 @@ class SoftphoneApp(QMainWindow):
         super().__init__()
         self.qapp = app
         self.setWindowTitle(APP_NAME)
+        _decorate_window(self, maximize=True)
         self.resize(520, 820)
         self.setMinimumSize(460, 760)
         self._base_title = APP_NAME
@@ -3238,6 +3259,7 @@ class SoftphoneApp(QMainWindow):
         if self.settings_win is None:
             win = QDialog(self)
             win.setWindowTitle("Configurações")
+            _decorate_window(win)
             win.resize(600, 680)
             win.setMinimumSize(520, 540)
             win.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, False)
@@ -3536,6 +3558,7 @@ class SoftphoneApp(QMainWindow):
         if self.adv_win is None:
             win = QDialog(self)
             win.setWindowTitle("Segurança e NAT")
+            _decorate_window(win)
             win.resize(460, 660)
             win.setMinimumSize(420, 620)
             self.adv_win = win
@@ -4169,6 +4192,7 @@ class SoftphoneApp(QMainWindow):
         if self.video_win is None:
             win = QDialog(self)
             win.setWindowTitle("Vídeo")
+            _decorate_window(win)
             win.resize(560, 860)
             win.setMinimumSize(520, 740)
             self.video_win = win
@@ -4556,6 +4580,7 @@ class SoftphoneApp(QMainWindow):
         if self.codec_win is None:
             win = QDialog(self)
             win.setWindowTitle("Configurações de Codecs")
+            _decorate_window(win)
             win.resize(560, 560)
             win.setMinimumSize(500, 460)
             self.codec_win = win
@@ -4776,6 +4801,7 @@ class SoftphoneApp(QMainWindow):
     def show_history(self):
         win = QDialog(self)
         win.setWindowTitle("Histórico de Chamadas")
+        _decorate_window(win)
         win.resize(560, 440)
         win.setMinimumSize(480, 340)
         self.history_win = win
@@ -4980,6 +5006,7 @@ class SoftphoneApp(QMainWindow):
             return
         win = QDialog(self)
         win.setWindowTitle("Contatos / Diretório")
+        _decorate_window(win)
         win.resize(600, 520)
         win.setMinimumSize(520, 420)
         self.contacts_win = win
@@ -5105,6 +5132,7 @@ class SoftphoneApp(QMainWindow):
         editing = contact is not None
         win = QDialog(self)
         win.setWindowTitle("Editar Contato" if editing else "Novo Contato")
+        _decorate_window(win)
         win.resize(460, 360)
         self.contact_edit_win = win
         form = QFormLayout(win)
@@ -5576,6 +5604,7 @@ class SoftphoneApp(QMainWindow):
         if self.prov_win is None:
             win = QDialog(self)
             win.setWindowTitle("Provisionamento e Atualização")
+            _decorate_window(win)
             win.resize(520, 560)
             win.setMinimumSize(480, 520)
             self.prov_win = win
