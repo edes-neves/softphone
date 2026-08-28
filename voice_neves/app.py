@@ -5013,7 +5013,16 @@ class SoftphoneApp(QMainWindow):
     # CONTATOS / DIRETÓRIO
     # =========================
     def _dialable_from_uri(self, raw):
-        s = str(raw or "")
+        s = str(raw or "").strip()
+        lt = s.rfind("<")
+        gt = s.rfind(">")
+        if lt != -1 and gt != -1 and gt > lt:
+            s = s[lt + 1:gt].strip()
+        else:
+            i = s.lower().rfind("sip:")
+            if i != -1:
+                s = s[i:]
+            s = s.strip('"').strip()
         if s.lower().startswith("sip:"):
             s = s[4:]
         s = s.split(";", 1)[0]
