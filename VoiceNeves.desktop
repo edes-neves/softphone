@@ -1,6 +1,6 @@
 [Desktop Entry]
 Name=Voice Neves
-Comment=Softphone SIP com tkinter e pjsua2
+Comment=Softphone SIP com Qt e pjsua2
 Exec=VoiceNeves
 Icon=Icone
 Terminal=false

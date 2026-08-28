@@ -153,3 +153,41 @@ def test_secrets_store_fallback_roundtrip(tmp_path):
         assert (os.stat(tmp_path / "sec.json").st_mode & 0o777) == 0o600
     sec.delete("k")
     assert sec.get("k", "gone") == "gone"
+
+
+def test_normalize_accounts_backup_server():
+    sec = FakeSecrets()
+    accounts = [
+        {"user": "100", "server": "pbx", "backup_server": "pbx2:5060"},
+        {"user": "200", "server": "pbx", "backup_server": "servidor inválido"},
+        {"user": "300", "server": "pbx"},  # sem backup -> default ""
+    ]
+    out = config._normalize_accounts(accounts, sec)
+    by_user = {a["user"]: a for a in out}
+    assert by_user["100"]["backup_server"] == "pbx2:5060"
+    assert by_user["200"]["backup_server"] == ""      # inválido -> limpo
+    assert by_user["300"]["backup_server"] == ""
+
+
+def test_clean_cti_default():
+    c = config._clean_cti(None)
+    assert c == {"enabled": False, "port": 9020, "token": ""}
+    assert config._clean_cti("lixo") == {"enabled": False, "port": 9020, "token": ""}
+
+
+def test_clean_cti_values():
+    c = config._clean_cti({"enabled": "true", "port": "8080", "token": "  segredo  "})
+    assert c["enabled"] is True
+    assert c["port"] == 8080
+    assert c["token"] == "segredo"
+
+
+def test_clean_cti_port_clamped():
+    assert config._clean_cti({"port": 999999})["port"] == 9020
+    assert config._clean_cti({"port": "abc"})["port"] == 9020
+
+
+def test_default_config_has_cti():
+    cfg = config._default_config(FakeSecrets())
+    assert "cti" in cfg
+    assert cfg["cti"]["enabled"] is False

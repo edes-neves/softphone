@@ -111,6 +111,50 @@ def build_sip_target(value, server):
     return f"sip:{value}@{server}" if server else ""
 
 
+_SIP_IDENTITY_MATCH = re.compile(r"<([^>]+)>")
+
+
+def extract_sip_identity(text):
+    """Extrai (nome_display, numero) de uma identidade/URI SIP de forma robusta.
+
+    Trata formatos comuns de chamada recebida, inclusive quando o "From"
+    traz um nome de exibição (chamado de "caller ID"):
+      '"João" <sip:3000@pbx;user=phone>'  -> ('João', '3000')
+      'João <sip:3000@pbx>'               -> ('João', '3000')
+      'sip:3000@pbx;transport=udp'        -> (None, '3000')
+      '3000'                              -> (None, '3000')
+
+    Retorna (None, None) quando não é possível extrair um número discável.
+    """
+    if not text:
+        return (None, None)
+    s = str(text).strip()
+    display = ""
+
+    m = _SIP_IDENTITY_MATCH.search(s)
+    if m:
+        pre = s[: m.start()].strip().strip('"').strip()
+        if pre.lower().startswith(("sip:", "tel:")):
+            pre = ""
+        display = pre
+        s = m.group(1)
+
+    if s.lower().startswith("sip:"):
+        s = s[4:]
+    elif s.lower().startswith("tel:"):
+        s = s[4:]
+
+    s = s.split(";", 1)[0]
+    if "@" in s:
+        s = s.rsplit("@", 1)[0].strip()
+        if s.lower() in ("", "sip", "unknown", ".invalid"):
+            s = ""
+    num = clean_extension(s)
+    if not num and not display:
+        return (None, None)
+    return (display or None, num or None)
+
+
 
 def _as_bool(value):
     """Converte valores de config (bool/str/int) em booleano."""
@@ -119,5 +163,54 @@ def _as_bool(value):
     if value is None:
         return False
     return str(value).strip().lower() in ("1", "true", "yes", "on")
+
+
+
+# =========================
+# MWI (Message Waiting Indicator)
+# =========================
+
+_MWI_VOICE_LINE = re.compile(
+    r"^\s*Voice-Message\s*:\s*([0-9]+)\s*/\s*([0-9]+)(?:\s*\([^)]*\))?\s*$",
+    re.IGNORECASE,
+)
+_MWI_WAITING_LINE = re.compile(r"^\s*Messages-Waiting\s*:\s*(yes|no)\s*$", re.IGNORECASE)
+
+
+def parse_mwi_count(message_text):
+    """Extrai o número de mensagens novas de um corpo SIP de NOTIFY (RFC 3842).
+
+    O body típico de um NOTIFY de correio de voz traz:
+
+        Message-Account: sip:mailbox@host
+        Messages-Waiting: yes
+        Voice-Message: 2/5 (0/0)
+
+    Retorna o número de mensagens novas (primeiro campo de "Voice-Message"),
+    ou 0 quando "Messages-Waiting: no", ou None caso o corpo não traga
+    indicação de mensagens (impossível aplicar/indefinido).
+    """
+    if not message_text:
+        return None
+    waiting = None
+    voice = None
+    try:
+        for raw in str(message_text).splitlines():
+            m = _MWI_WAITING_LINE.match(raw)
+            if m:
+                waiting = m.group(1).lower()
+                continue
+            m = _MWI_VOICE_LINE.match(raw)
+            if m:
+                new = int(m.group(1))
+                total = int(m.group(2))
+                voice = {"new": new, "total": total}
+    except (TypeError, ValueError):
+        return None
+    if voice is not None:
+        return voice["new"]
+    if waiting == "no":
+        return 0
+    return None
 
 

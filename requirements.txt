@@ -1,6 +1,9 @@
 # Dependências de build/empacotamento
 pyinstaller>=6.0
 
+# Interface gráfica (Qt via PySide6)
+PySide6>=6.0
+
 # Armazenamento seguro de senhas (keyring do sistema)
 # Opcional: sem keyring o app usa um arquivo local com permissão 0600.
 keyring>=24.0

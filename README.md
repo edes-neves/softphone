@@ -1,7 +1,7 @@
-# Softphone SIP (tkinter + pjsua2)
+# Softphone SIP (PySide6/Qt + pjsua2)
 
 Softphone para Linux usando a pilha VoIP PJSIP (`pjsua2`) com interface gráfica em
-Tkinter. Suporta múltiplas contas SIP, registro automático, chamadas de saída,
+Qt (`PySide6`). Suporta múltiplas contas SIP, registro automático, chamadas de saída,
 chamadas de entrada (atender/recusar), mute, controle de volume e seleção de
 dispositivos de áudio.
 
@@ -9,7 +9,7 @@ dispositivos de áudio.
 
 O projeto agora é um pacote `voice_neves/` (a aplicação monolítica
 `softphone.py` virou um lançador fino). A camada de **lógica pura** foi separada
-e é testável sem `tkinter` nem `pjsua2`:
+e é testável sem `PySide6` nem `pjsua2`:
 
 | Módulo                       | Responsabilidade                                            |
 | ---------------------------- | ----------------------------------------------------------- |
@@ -23,7 +23,9 @@ e é testável sem `tkinter` nem `pjsua2`:
 | `voice_neves/ldap_manager.py` | Agenda corporativa LDAP com cache (opcional)                |
 | `voice_neves/pjsip_models.py` | Wrappers pjsua2: `MyAccount`/`MyBuddy`/`MyCall`            |
 | `voice_neves/runtime.py`    | Singleton do cofre de senhas                                |
-| `voice_neves/app.py`         | UI (tkinter) + controlador `SoftphoneApp` + globais de cor   |
+| `voice_neves/provisioning.py` | Auto-provisioning: config remota (JSON) + cache offline    |
+| `voice_neves/updater.py`    | Atualização automática: version.json + download/checksum    |
+| `voice_neves/app.py`         | UI (PySide6/Qt) + controlador `SoftphoneApp` + globais de cor   |
 | `voice_neves/__main__.py`    | Ponto de entrada (`main()`)                                 |
 
 As globais mutáveis de cor (`COLOR_*`) permanecem no `app.py` (mesmo módulo da
@@ -187,6 +189,60 @@ etc.).
 - Tema claro/escuro (menu **Exibir → Tema Escuro**), persistido na configuração
 - Codec G.729 (grátis) via BCG729, embutido estaticamente no `libpjmedia-codec.so`
 - Logs detalhados em arquivo (`app.log`)
+
+## Provisionamento e Atualização automática
+
+### Auto-provisioning (config remota)
+
+O app pode sincronizar contas (e opcionalmente Segurança/NAT) a partir de uma
+config remota servida em JSON, ideal para implantação corporativa: o servidor
+dita os ramais e a política, e o app as aplica. Acesse
+**Config. → Provisionamento e Atualização**: habilite, informe a URL e o
+intervalo de sincronização (5–1440 min). As contas provisionadas são
+**mescladas** com as locais (por `user@server`); senhas vão para o cofre.
+Um **cache local** guarda o último sync válido e é usado como *fallback
+offline*, além de ser aplicado na inicialização.
+
+Formato do JSON servido:
+
+```json
+{
+  "version": 3,
+  "accounts": [
+    {"user": "100", "server": "sip.exemplo.com", "password": "segredo",
+     "forward_unconditional": "", "forward_busy": "199",
+     "forward_no_answer": "", "forward_no_answer_timeout": 20}
+  ],
+  "security": {"srtp": "optional"},
+  "nat": {"ice": true, "stun_server": "stun.exemplo.com"}
+}
+```
+
+Opcionalmente, `auth_user` + senha (HTTP Basic) autenticam a busca; a senha é
+guardada no cofre (keyring) sob a chave `provision_auth`.
+
+### Atualização automática
+
+O app pode checar novas versões, baixar e validar (SHA-256) o novo binário.
+Informe a URL de um `version.json` em **Config. → Provisionamento e
+Atualização**. Na inicialização (e periodicamente), o app avisa quando há uma
+versão nova.
+
+Formato do `version.json`:
+
+```json
+{
+  "version": "1.1.0",
+  "url": "https://meuservidor/downloads/VoiceNeves-1.1.0.AppImage",
+  "sha256": "<sha256-hex-do-arquivo>"
+}
+```
+
+Por segurança, o download é baixado para uma pasta temporária e **validado**;
+o app mostra onde o arquivo ficou e orienta a substituir o binário/app atual e
+reiniciar (não sobrescreve um binário em execução, evitando corromper o app).
+
+
 
 ## Solução de problemas (áudio)
 

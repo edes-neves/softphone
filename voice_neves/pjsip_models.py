@@ -38,6 +38,21 @@ if _HAS_PJSUA2:
                 prm.reason or "sem motivo",
             )
             self.app._ui(self.app.update_account_status, self, status)
+            if status == "OFFLINE":
+                # Failover de servidor: o app tenta um servidor de backup
+                # quando o registro no servidor ativo falha.
+                self.app._ui(self.app._on_account_reg_failed, self)
+
+        def onMwiInfo(self, prm):
+            from .utils import parse_mwi_count
+
+            count = None
+            try:
+                whole = getattr(prm.rdata, "wholeMsg", None) or ""
+                count = parse_mwi_count(whole)
+            except Exception as e:
+                logging.debug("onMwiInfo(%s): %s", self.data.get("user"), e)
+            self.app._ui(self.app._on_mwi_info, self, count)
 
         def onIncomingCall(self, prm):
             try:

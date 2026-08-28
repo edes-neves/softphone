@@ -36,10 +36,15 @@ def _normalize_accounts(accounts, secrets):
             timeout = int(item.get("forward_no_answer_timeout", 20))
         except (TypeError, ValueError):
             timeout = 20
+        backup_server = str(item.get("backup_server") or "").strip()
+        if backup_server and not is_valid_server(backup_server):
+            logging.warning("Servidor de backup inválido para %s: %r", key, backup_server)
+            backup_server = ""
         result.append(
             {
                 "user": user,
                 "server": server,
+                "backup_server": backup_server,
                 "forward_unconditional": str(item.get("forward_unconditional") or "").strip(),
                 "forward_busy": str(item.get("forward_busy") or "").strip(),
                 "forward_no_answer": str(item.get("forward_no_answer") or "").strip(),
@@ -142,6 +147,51 @@ def _clean_zrtp(raw):
 
 
 
+def _clean_provisioning(raw):
+    """Normaliza a seção de provisioning (config remota) da configuração."""
+    if not isinstance(raw, dict):
+        raw = {}
+    try:
+        interval = max(5, min(1440, int(raw.get("interval_min", 60))))
+    except (TypeError, ValueError):
+        interval = 60
+    return {
+        "enabled": _as_bool(raw.get("enabled")),
+        "url": str(raw.get("url") or "").strip(),
+        "auth_user": str(raw.get("auth_user") or "").strip(),
+        "interval_min": interval,
+    }
+
+
+def _clean_updater(raw):
+    """Normaliza a seção de atualização automática da configuração."""
+    if not isinstance(raw, dict):
+        raw = {}
+    return {
+        "enabled": _as_bool(raw.get("enabled")),
+        "url": str(raw.get("url") or "").strip(),
+        "auth_user": str(raw.get("auth_user") or "").strip(),
+        "check_on_start": _as_bool(raw.get("check_on_start", True)),
+    }
+
+
+def _clean_cti(raw):
+    """Normaliza a seção da API/CTI REST (integração externa) da configuração."""
+    if not isinstance(raw, dict):
+        raw = {}
+    try:
+        port = int(raw.get("port", 9020))
+    except (TypeError, ValueError):
+        port = 9020
+    if not (1 <= port <= 65535):
+        port = 9020
+    return {
+        "enabled": _as_bool(raw.get("enabled")),
+        "port": port,
+        "token": str(raw.get("token") or "").strip(),
+    }
+
+
 def _default_config(secrets):
     return {
         "accounts": [],
@@ -161,6 +211,9 @@ def _default_config(secrets):
         "security": _clean_security(None),
         "nat": _clean_nat(None, secrets),
         "video": _clean_video(None),
+        "provisioning": _clean_provisioning(None),
+        "updater": _clean_updater(None),
+        "cti": _clean_cti(None),
     }
 
 
@@ -228,6 +281,9 @@ def load_config(secrets):
             "security": _clean_security(data.get("security")),
             "nat": _clean_nat(data.get("nat"), secrets),
             "video": _clean_video(data.get("video")),
+            "provisioning": _clean_provisioning(data.get("provisioning")),
+            "updater": _clean_updater(data.get("updater")),
+            "cti": _clean_cti(data.get("cti")),
         }
     except Exception as e:
         logging.error("Erro ao ler config (%s); usando configuração vazia", e)

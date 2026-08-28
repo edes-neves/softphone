@@ -76,3 +76,62 @@ def test_constants_regex():
     assert C.EXT_RE.match("3000")
     assert C.SERVER_RE.match("host:5060")
     assert not C.EXT_RE.match("a b")
+
+
+def test_parse_mwi_count_with_new_messages():
+    body = (
+        "Message-Account: sip:mailbox@pbx.x\n"
+        "Messages-Waiting: yes\n"
+        "Voice-Message: 2/5 (0/0)\n"
+    )
+    assert utils.parse_mwi_count(body) == 2
+
+
+def test_parse_mwi_count_no_new_messages():
+    body = (
+        "Message-Account: sip:mailbox@pbx.x\n"
+        "Messages-Waiting: no\n"
+        "Voice-Message: 0/5 (0/0)\n"
+    )
+    assert utils.parse_mwi_count(body) == 0
+
+
+def test_parse_mwi_count_waiting_no_without_voice():
+    assert utils.parse_mwi_count("Messages-Waiting: no\n") == 0
+
+
+def test_parse_mwi_count_no_body_returns_none():
+    assert utils.parse_mwi_count("") is None
+    assert utils.parse_mwi_count(None) is None
+
+
+def test_parse_mwi_count_unrelated_body_returns_none():
+    assert utils.parse_mwi_count("sip:3000\nContent-Type: application/sdp\n") is None
+
+
+def test_parse_mwi_count_ignores_case_and_whitespace():
+    body = "MESSAGES-WAITING: YES\n  voice-message : 1 / 3  \n"
+    assert utils.parse_mwi_count(body) == 1
+
+
+def test_extract_sip_identity_plain():
+    assert utils.extract_sip_identity("sip:3000@pbx;transport=udp") == (None, "3000")
+    assert utils.extract_sip_identity("sip:3000@pbx") == (None, "3000")
+    assert utils.extract_sip_identity("3000") == (None, "3000")
+
+
+def test_extract_sip_identity_with_display_name():
+    # "From" com caller ID: '"João" <sip:3000@pbx>'
+    assert utils.extract_sip_identity('"João" <sip:3000@pbx;user=phone>') == ("João", "3000")
+    assert utils.extract_sip_identity("João <sip:3000@pbx>") == ("João", "3000")
+
+
+def test_extract_sip_identity_invalid():
+    assert utils.extract_sip_identity("") == (None, None)
+    assert utils.extract_sip_identity("sip:@host") == (None, None)
+    assert utils.extract_sip_identity("sip:unknown@host") == (None, None)
+    assert utils.extract_sip_identity(None) == (None, None)
+
+
+def test_extract_sip_identity_keeps_plus():
+    assert utils.extract_sip_identity("sip:+5511999999999@pbx") == (None, "+5511999999999")
