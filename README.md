@@ -255,7 +255,29 @@ Por segurança, o download é baixado para uma pasta temporária e **validado**
 substituir o binário/app atual e reiniciar (não sobrescreve um binário em
 execução, evitando corromper o app).
 
+### Como lançar uma versão (`bump.sh`)
 
+O script `bump.sh` padroniza o lançamento: ele atualiza a versão, gera o commit,
+cria a tag `v<versão>` e faz o push que dispara o release automático.
+
+```bash
+./bump.sh 1.1.1                  # bump + commit + tag + push (usuário médio)
+./bump.sh 1.1.1 --date 09/2026   # atualiza também a data exibida na UI
+./bump.sh 1.1.1 --dry-run        # mostra o que fará, sem alterar nada
+```
+
+O que ele faz:
+1. Valida SemVer (`X.Y.Z`) e que a nova é **maior** que a atual;
+2. Atualiza `__version__` em `voice_neves/__init__.py` (fonte da versão;
+   `--date` também atualiza `APP_UPDATED` em `constants.py`);
+3. Exige tree limpa, commita e cria a tag `v<versão>`;
+4. Faz `git push` do branch e da tag.
+
+**Regra de ouro:** a tag **sempre** deve bater com `__version__` — o
+`release.yml` deriva a versão publicada do tag. Como o script lê a versão atual
+do `__init__.py`, é impossível desalinhá-las usando o `bump.sh`.
+
+Após o push, o GitHub Actions gera o AppImage e o `version.json` sozinho.
 
 ## Solução de problemas (áudio)
 
