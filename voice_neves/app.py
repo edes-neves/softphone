@@ -649,8 +649,8 @@ class SoftphoneApp(QMainWindow):
         self.qapp = app
         self.setWindowTitle(APP_NAME)
         _decorate_window(self, maximize=True)
-        self.resize(520, 820)
-        self.setMinimumSize(460, 760)
+        self.resize(520, 760)
+        self.setMinimumSize(460, 680)
         self._base_title = APP_NAME
 
         self._icon = QIcon(resource_path("Icone.png"))
@@ -940,7 +940,7 @@ class SoftphoneApp(QMainWindow):
     def _header(self):
         header = QWidget()
         header.setStyleSheet(f"background:{COLOR_HEADER};")
-        header.setFixedHeight(64)
+        header.setFixedHeight(50)
         lay = QHBoxLayout(header)
         lay.setContentsMargins(16, 0, 14, 0)
 
@@ -972,7 +972,7 @@ class SoftphoneApp(QMainWindow):
     def _group(self, title, parent_layout):
         g = QGroupBox(title)
         v = QVBoxLayout(g)
-        v.setContentsMargins(10, 10, 10, 10)
+        v.setContentsMargins(8, 6, 8, 6)
         parent_layout.addWidget(g)
         return g, v
 
@@ -991,8 +991,8 @@ class SoftphoneApp(QMainWindow):
         body.setStyleSheet("QScrollArea { background: transparent; border: none; }")
         body_widget = QWidget()
         bl = QVBoxLayout(body_widget)
-        bl.setContentsMargins(12, 12, 12, 12)
-        bl.setSpacing(10)
+        bl.setContentsMargins(8, 8, 8, 8)
+        bl.setSpacing(6)
         body.setWidget(body_widget)
         outer.addWidget(body, 1)
 
@@ -1000,11 +1000,11 @@ class SoftphoneApp(QMainWindow):
         acc_group, acc_v = self._group("Contas SIP", bl)
         self.listbox = QListWidget()
         self.listbox.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
-        self.listbox.setFixedHeight(72)
+        self.listbox.setFixedHeight(54)
         acc_v.addWidget(self.listbox)
         row = QHBoxLayout()
-        self.btn_edit = RoundedButton(self, "Editar conta", self.edit_account, COLOR_KEYPAD_BG, COLOR_KEYPAD_FG, pady=5)
-        self.btn_delete = RoundedButton(self, "Deletar conta", self.delete_account, COLOR_KEYPAD_BG, COLOR_KEYPAD_FG, pady=5)
+        self.btn_edit = RoundedButton(self, "Editar conta", self.edit_account, COLOR_KEYPAD_BG, COLOR_KEYPAD_FG, pady=4)
+        self.btn_delete = RoundedButton(self, "Deletar conta", self.delete_account, COLOR_KEYPAD_BG, COLOR_KEYPAD_FG, pady=4)
         row.addWidget(self.btn_edit)
         row.addWidget(self.btn_delete)
         acc_v.addLayout(row)
@@ -1023,15 +1023,15 @@ class SoftphoneApp(QMainWindow):
         keypad.setSpacing(4)
         for i, key in enumerate("123456789*0#"):
             r, c = divmod(i, 3)
-            btn = RoundedButton(self, key, lambda k=key: self.on_keypad_press(k), COLOR_KEYPAD_BG, COLOR_KEYPAD_FG, pady=6)
-            btn.setMinimumHeight(46)
+            btn = RoundedButton(self, key, lambda k=key: self.on_keypad_press(k), COLOR_KEYPAD_BG, COLOR_KEYPAD_FG, pady=4)
+            btn.setMinimumHeight(38)
             keypad.addWidget(btn, r, c)
         dial_v.addLayout(keypad)
 
         feat = QHBoxLayout()
-        self.btn_hold = RoundedButton(self, "⏸  Espera", self.toggle_hold, COLOR_KEYPAD_BG, COLOR_KEYPAD_FG, pady=6)
-        self.btn_transfer = RoundedButton(self, "↪  Transf.", self.open_transfer, COLOR_KEYPAD_BG, COLOR_KEYPAD_FG, pady=6)
-        self.btn_redial = RoundedButton(self, "↺  Rediscar", self.redial, COLOR_KEYPAD_BG, COLOR_KEYPAD_FG, pady=6)
+        self.btn_hold = RoundedButton(self, "⏸  Espera", self.toggle_hold, COLOR_KEYPAD_BG, COLOR_KEYPAD_FG, pady=4)
+        self.btn_transfer = RoundedButton(self, "↪  Transf.", self.open_transfer, COLOR_KEYPAD_BG, COLOR_KEYPAD_FG, pady=4)
+        self.btn_redial = RoundedButton(self, "↺  Rediscar", self.redial, COLOR_KEYPAD_BG, COLOR_KEYPAD_FG, pady=4)
         feat.addWidget(self.btn_hold)
         feat.addWidget(self.btn_transfer)
         feat.addWidget(self.btn_redial)
@@ -1044,16 +1044,16 @@ class SoftphoneApp(QMainWindow):
         self.refresh_favorites()
 
         call_row = QHBoxLayout()
-        self.btn_call = RoundedButton(self, "📞  Ligar", self.make_call, COLOR_KEYPAD_BG, COLOR_KEYPAD_FG, pady=6)
-        self.btn_answer = RoundedButton(self, "✅  Atender", self.answer, COLOR_KEYPAD_BG, COLOR_KEYPAD_FG, pady=6)
+        self.btn_call = RoundedButton(self, "📞  Ligar", self.make_call, COLOR_KEYPAD_BG, COLOR_KEYPAD_FG, pady=4)
+        self.btn_answer = RoundedButton(self, "✅  Atender", self.answer, COLOR_KEYPAD_BG, COLOR_KEYPAD_FG, pady=4)
         call_row.addWidget(self.btn_call)
         call_row.addWidget(self.btn_answer)
         dial_v.addLayout(call_row)
 
         media_row = QHBoxLayout()
-        self.btn_mute = RoundedButton(self, "Mute", self.toggle_mute, COLOR_WARNING, COLOR_TEXT, pady=6)
-        self.btn_record = RoundedButton(self, "⏺  Gravar", self.toggle_record, COLOR_KEYPAD_BG, COLOR_KEYPAD_FG, pady=6)
-        self.btn_video = RoundedButton(self, "📹  Vídeo", self.toggle_video, COLOR_KEYPAD_BG, COLOR_KEYPAD_FG, pady=6)
+        self.btn_mute = RoundedButton(self, "Mute", self.toggle_mute, COLOR_WARNING, COLOR_TEXT, pady=4)
+        self.btn_record = RoundedButton(self, "⏺  Gravar", self.toggle_record, COLOR_KEYPAD_BG, COLOR_KEYPAD_FG, pady=4)
+        self.btn_video = RoundedButton(self, "📹  Vídeo", self.toggle_video, COLOR_KEYPAD_BG, COLOR_KEYPAD_FG, pady=4)
         media_row.addWidget(self.btn_mute)
         media_row.addWidget(self.btn_record)
         media_row.addWidget(self.btn_video)
@@ -1064,7 +1064,7 @@ class SoftphoneApp(QMainWindow):
         switch_row = QHBoxLayout()
         self.call_switch_box = QComboBox()
         self.call_switch_box.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-        self.btn_alternate = RoundedButton(self, "Alternar", self.alternate_call, COLOR_PRIMARY, "#FFFFFF", pady=5)
+        self.btn_alternate = RoundedButton(self, "Alternar", self.alternate_call, COLOR_PRIMARY, "#FFFFFF", pady=4)
         switch_row.addWidget(self.call_switch_box, 1)
         switch_row.addWidget(self.btn_alternate)
         active_v.addLayout(switch_row)
@@ -5686,7 +5686,7 @@ class SoftphoneApp(QMainWindow):
             win = QDialog(self)
             win.setWindowTitle("Provisionamento e Atualização")
             _decorate_window(win)
-            win.resize(520, 560)
+            win.resize(520, 600)
             win.setMinimumSize(480, 520)
             self.prov_win = win
             lay = QVBoxLayout(win)
