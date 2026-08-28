@@ -279,6 +279,17 @@ do `__init__.py`, é impossível desalinhá-las usando o `bump.sh`.
 
 Após o push, o GitHub Actions gera o AppImage e o `version.json` sozinho.
 
+### Verificação de integração (live) do updater
+
+O teste `tests/test_updater_live.py` simula o app contra o repositório público:
+baixa o `version.json` real, confere SemVer/SHA-256 e que a URL do AppImage
+está acessível (HEAD). Ele é **pulado por padrão** (mantém o `pytest` offline e
+rápido); rode explicitamente após uma release:
+
+```bash
+LIVE_UPDATE_TEST=1 python -m pytest tests/test_updater_live.py -v
+```
+
 ## Solução de problemas (áudio)
 
 ### BigLinux / Manjaro / Arch-based: chamadas mudas ou erro ao ligar
