@@ -224,23 +224,36 @@ guardada no cofre (keyring) sob a chave `provision_auth`.
 ### Atualização automática
 
 O app pode checar novas versões, baixar e validar (SHA-256) o novo binário.
-Informe a URL de um `version.json` em **Config. → Provisionamento e
-Atualização**. Na inicialização (e periodicamente), o app avisa quando há uma
-versão nova.
+Na inicialização (e periodicamente), o app consulta um `version.json` e avisa
+se houver versão nova. A URL do arquivo é informada em **Config. →
+Provisionamento e Atualização** (campo "URL version.json").
+
+**Via GitHub (padrão):** o workflow `release.yml` publica o AppImage e o
+`version.json` a cada release com **tag** (ex.: `v1.1.0`), commitando o arquivo
+no branch `master`. O app já vem configurado com a URL estável **por padrão**:
+
+```
+https://raw.githubusercontent.com/edes-neves/softphone/master/version.json
+```
+
+Basta criar a tag `v<versão>` e o GitHub faz o resto (AppImage + sha256 real).
+Qualquer outra URL (próprio servidor/NAS) também funciona — o app não depende
+de GitHub.
 
 Formato do `version.json`:
 
 ```json
 {
   "version": "1.1.0",
-  "url": "https://meuservidor/downloads/VoiceNeves-1.1.0.AppImage",
+  "url": "https://github.com/edes-neves/softphone/releases/download/v1.1.0/VoiceNeves-x86_64.AppImage",
   "sha256": "<sha256-hex-do-arquivo>"
 }
 ```
 
-Por segurança, o download é baixado para uma pasta temporária e **validado**;
-o app mostra onde o arquivo ficou e orienta a substituir o binário/app atual e
-reiniciar (não sobrescreve um binário em execução, evitando corromper o app).
+Por segurança, o download é baixado para uma pasta temporária e **validado**
+(SHA-256 quando presente); o app mostra onde o arquivo ficou e orienta a
+substituir o binário/app atual e reiniciar (não sobrescreve um binário em
+execução, evitando corromper o app).
 
 
 

@@ -191,3 +191,12 @@ def test_default_config_has_cti():
     cfg = config._default_config(FakeSecrets())
     assert "cti" in cfg
     assert cfg["cti"]["enabled"] is False
+
+
+def test_clean_updater_default_url():
+    up = config._clean_updater(None)
+    assert up["enabled"] is False
+    assert up["url"] == config.DEFAULT_UPDATER_URL
+    assert up["check_on_start"] is True
+    # url explícita não é sobrescrita
+    assert config._clean_updater({"url": "https://servidor/x.json"})["url"] == "https://servidor/x.json"

@@ -5609,7 +5609,7 @@ class SoftphoneApp(QMainWindow):
             self.upd_enabled.setChecked(bool(uc.get("enabled")))
             uv.addRow(self.upd_enabled)
             self.upd_url = QLineEdit(str(uc.get("url") or ""))
-            self.upd_url.setPlaceholderText("https://servidor/version.json")
+            self.upd_url.setPlaceholderText("https://raw.githubusercontent.com/USER/REPO/master/version.json")
             uv.addRow("URL version.json", self.upd_url)
             self.upd_auth_user = QLineEdit(str(uc.get("auth_user") or ""))
             uv.addRow("Usuário", self.upd_auth_user)

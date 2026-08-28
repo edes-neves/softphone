@@ -2,6 +2,7 @@
 import os
 import re
 
+from . import __version__ as _pkg_version
 from . import platform
 
 __all__ = [
@@ -15,7 +16,7 @@ __all__ = [
 ]
 
 APP_NAME = "Voice Neves"
-APP_VERSION = "1.0.4"
+APP_VERSION = _pkg_version
 APP_DEV = "José Edes Neves"
 APP_UPDATED = "08/2026"
 CONTACT_EMAIL = "nevestecnologias@gmail.com"

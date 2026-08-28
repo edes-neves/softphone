@@ -163,13 +163,19 @@ def _clean_provisioning(raw):
     }
 
 
+# URL padrão do version.json — publicação automática pelo release.yml: o app
+# consulta a URL estável (raw) do arquivo commitado no branch padrão, que é
+# atualizado a cada release. O usuário pode trocar por qualquer outra URL.
+DEFAULT_UPDATER_URL = "https://raw.githubusercontent.com/edes-neves/softphone/master/version.json"
+
+
 def _clean_updater(raw):
     """Normaliza a seção de atualização automática da configuração."""
     if not isinstance(raw, dict):
         raw = {}
     return {
         "enabled": _as_bool(raw.get("enabled")),
-        "url": str(raw.get("url") or "").strip(),
+        "url": str(raw.get("url") or DEFAULT_UPDATER_URL).strip(),
         "auth_user": str(raw.get("auth_user") or "").strip(),
         "check_on_start": _as_bool(raw.get("check_on_start", True)),
     }
