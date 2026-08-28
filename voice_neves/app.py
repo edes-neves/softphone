@@ -1541,6 +1541,14 @@ class SoftphoneApp(QMainWindow):
         self.update_presence()
 
     def refresh(self):
+        """Campo 'Contas SIP': mostra as contas, ou durante/in para chamadas o
+        número e o tempo decorrido da chamada no mesmo espaço."""
+        if self.call_state in ("INCOMING", "RINGING", "CALLING", "IN_CALL", "HOLD"):
+            self._populate_active_call()
+        else:
+            self._populate_accounts()
+
+    def _populate_accounts(self):
         keep_idx = self.listbox.currentRow()
         self.listbox.clear()
         status_cfg = {
@@ -1564,6 +1572,66 @@ class SoftphoneApp(QMainWindow):
             self.listbox.addItem(item)
         if keep_idx is not None and 0 <= keep_idx < self.listbox.count():
             self.listbox.setCurrentRow(keep_idx)
+
+    def _active_caller_display(self):
+        call = self.current_call
+        if call is None:
+            return "—"
+        try:
+            remote = call.getInfo().remoteUri
+        except Exception:
+            remote = ""
+        contact = self._find_contact_by_number(remote)
+        if contact:
+            return contact["name"]
+        num = self._dialable_from_uri(remote)
+        return num or "desconhecido"
+
+    def _populate_active_call(self):
+        self._call_box_timer_item = None
+        self.listbox.clear()
+        caller = self._active_caller_display()
+        state = self.call_state
+        if state in ("IN_CALL", "HOLD"):
+            color = STATUS_COLORS.get(state, COLOR_PRIMARY)
+            item = QListWidgetItem(f"📞  {caller}")
+            item.setForeground(QColor(color))
+            self.listbox.addItem(item)
+            timer_item = QListWidgetItem("")
+            timer_item.setForeground(QColor(COLOR_TEXT))
+            self.listbox.addItem(timer_item)
+            self._call_box_timer_item = timer_item
+            self._update_active_call_timer()
+        else:
+            status_text = {
+                "INCOMING": "Chamada recebida...",
+                "RINGING": "Tocando...",
+                "CALLING": "Chamando...",
+            }.get(state, "")
+            color = STATUS_COLORS.get(state, COLOR_PRIMARY)
+            item = QListWidgetItem(f"📞  {caller}  ·  {status_text}".strip())
+            item.setForeground(QColor(color))
+            self.listbox.addItem(item)
+
+    def _format_call_time(self, start):
+        elapsed = max(0, int(time.time() - start))
+        h, m, s = elapsed // 3600, (elapsed % 3600) // 60, elapsed % 60
+        return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
+
+    def _update_active_call_timer(self):
+        if getattr(self, "_call_box_timer_item", None) is None:
+            return
+        call = self.current_call
+        start = None
+        if call is not None:
+            try:
+                start = self._call_started.get(call.getId())
+            except Exception:
+                start = None
+        if start is None:
+            self._call_box_timer_item.setText("")
+            return
+        self._call_box_timer_item.setText(f"⏱  {self._format_call_time(start)}")
 
     def load_devices(self):
         if self.endpoint is None:
@@ -3095,6 +3163,8 @@ class SoftphoneApp(QMainWindow):
             if self.windowTitle() != self._base_title:
                 self.setWindowTitle(self._base_title)
         self._publish_presence()
+        if hasattr(self, "listbox"):
+            self.refresh()
 
     def _sync_call_timer(self):
         call = self.current_call
@@ -3140,13 +3210,9 @@ class SoftphoneApp(QMainWindow):
                 self._timer_timer = None
             self._set_timer_text("")
             return
-        elapsed = max(0, int(time.time() - start))
-        h, m, s = elapsed // 3600, (elapsed % 3600) // 60, elapsed % 60
-        if h:
-            text = f"{h}:{m:02d}:{s:02d}"
-        else:
-            text = f"{m}:{s:02d}"
+        text = self._format_call_time(start)
         self._set_timer_text(text)
+        self._update_active_call_timer()
         self._update_qos_label()
 
     def _stop_call_timer(self):
@@ -4007,6 +4073,7 @@ class SoftphoneApp(QMainWindow):
         if hasattr(self, "btn_video"):
             self._update_video_btn()
         self.refresh_call_switcher()
+        self.refresh()
 
     def _blink_answer(self, active=None):
         if active is None:

@@ -16,8 +16,8 @@ THEMES = {
         "keypad_fg": "#FFFFFF",
         "tooltip_bg": "#1F2937",
         "tooltip_fg": "#FFFFFF",
-        "btn_disabled_bg": "#D5DBE3",
-        "btn_disabled_fg": "#5B6673",
+        "btn_disabled_bg": "#C1CAD4",
+        "btn_disabled_fg": "#3E4A58",
     },
     "dark": {
         "bg": "#161A23",
