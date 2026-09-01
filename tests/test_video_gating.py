@@ -15,7 +15,10 @@ import types
 
 import pytest
 
-from voice_neves import app as app_module
+try:
+    from voice_neves import app as app_module
+except Exception as e:  # PySide6/Qt indisponivel (ex.: CI sem display/libEGL)
+    pytest.skip(f"app (PySide6/Qt) indisponivel neste ambiente: {e}", allow_module_level=True)
 
 REAL_PJ = app_module.pj
 
