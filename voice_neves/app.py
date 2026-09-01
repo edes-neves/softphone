@@ -61,7 +61,7 @@ from .utils import (
     clean_extension, is_valid_extension, is_valid_server,
     build_sip_target, _as_bool,
 )
-from .config import _account_key, _clean_ldap, _clean_zrtp, load_config, save_config
+from .config import _account_key, _clean_ldap, load_config, save_config
 from .history import load_history, save_history
 from .contacts_store import ContactsStore
 from .ldap_manager import LDAPManager
@@ -219,23 +219,87 @@ def QFontDatabase_families():
         return []
 
 
+_x11_display_ptr = None
+
+
+def _x11_display():
+    """Retorna o ponteiro 'Display *' do servidor X11 (via libX11), cacheado.
+
+    O renderer de vídeo do PJSIP, ao embutir no window nativo do Qt (X11/xcb),
+    precisa do Display* do servidor X junto com o window. Sem ele, nada é
+    desenhado. Abre uma conexão e guarda o ponteiro para reuso.
+    """
+    global _x11_display_ptr
+    if _x11_display_ptr is not None:
+        return _x11_display_ptr
+    import ctypes as _ct
+
+    ptr = 0
+    try:
+        _x11 = _ct.CDLL("libX11.so.6")
+        _x11.XOpenDisplay.restype = _ct.c_void_p
+        _x11.XOpenDisplay.argtypes = [_ct.c_char_p]
+        ptr = _x11.XOpenDisplay(None) or 0
+    except Exception as e:
+        logging.warning("Não foi possível abrir o Display X11 para vídeo: %s", e)
+    _x11_display_ptr = ptr
+    return ptr
+
+
 def _native_video_handle(xid):
-    """Cria um VideoWindowHandle apontando para uma janela nativa X11 (Qt winId)."""
+    """Cria um VideoWindowHandle X11 apontando para a janela nativa (Qt winId).
+
+    O struct pj::VideoWindowHandle é { pjmedia_vid_dev_hwnd_type type; // int32
+    WindowHandle handle; } com 'handle' = { void* window; void* display; }.
+    Aqui montamos manualmente os campos de forma confiável, já que o enum do
+    tipo (PJMEDIA_VID_DEV_HWND_TYPE_WINDOW) não é exposto pelo SWIG do pjsua2.
+    """
     import ctypes as _ct
 
     h = pj.VideoWindowHandle()
     try:
-        h.type = pj.PJMEDIA_VID_DEV_HWND_TYPE_WINDOWS
-    except Exception:
-        pass
-    wh = h.handle
-    try:
-        addr = int(wh.this)
-        _ct.c_uint64.from_address(addr).value = int(xid)      # void *window
-        _ct.c_uint64.from_address(addr + 8).value = 0         # void *display
+        base = int(h.this)
+        _ct.c_int32.from_address(base).value = 1            # HWND_TYPE_WINDOW (X11)
+        _ct.c_uint64.from_address(base + 8).value = int(xid)   # void *window
+        _ct.c_uint64.from_address(base + 16).value = _x11_display()  # void *display
     except Exception as e:
         logging.warning("Falha ao setar window handle de vídeo: %s", e)
     return h
+
+
+def _call_with_timeout(fn, timeout=5.0):
+    """Executa uma chamada potencialmente bloqueante (C/PJSIP) em thread daemon.
+
+    Retorna True se concluiu dentro do timeout; False se ainda estava presa.
+    Nunca bloqueia a thread principal (evita "travar" a UI no encerramento).
+    """
+    import threading as _th
+
+    done = _th.Event()
+    result = {}
+
+    def _run():
+        try:
+            result["ok"] = True
+            fn()
+        except Exception as e:
+            result["ok"] = False
+            result["err"] = e
+        finally:
+            done.set()
+
+    try:
+        t = _th.Thread(target=_run, name="pj-teardown", daemon=True)
+        t.start()
+        if not done.wait(timeout):
+            logging.warning("Chamada de encerramento PJSIP excedeu %ss; continuando", timeout)
+            return False
+    except Exception as e:
+        logging.warning("Falha ao proteger chamada de encerramento: %s", e)
+        return False
+    if not result.get("ok"):
+        raise result["err"]
+    return True
 
 
 # =========================
@@ -698,9 +762,12 @@ class SoftphoneApp(QMainWindow):
         self._edit_entry = None
         self.adv_win = None
         self.prov_win = None
+        self.advtabs_win = None
 
         self.video_enabled = False
         self._has_video = False
+        self._video_workaround_dev = -1
+        self._video_warning = None
         self.video_win = None
         self.video_surface = None
         self.video_placeholder = None
@@ -715,6 +782,11 @@ class SoftphoneApp(QMainWindow):
         self.video_resolution_box = None
         self.video_info_label = None
         self.btn_screen_share = None
+
+        self._cached_ins = []
+        self._cached_outs = []
+        self._cached_cams = []
+        self._cached_screen = -1
 
         self._main_tid = threading.get_ident()
         self._ui_queue = queue.Queue()
@@ -757,12 +829,6 @@ class SoftphoneApp(QMainWindow):
             _picked_font = cfg_font
             self._font_name = cfg_font
         self.ldap_manager = LDAPManager(self, self.config_data.get("ldap", {}), secrets)
-        self.zrtp_config = _clean_zrtp(self.config_data.get("zrtp"))
-        self.zrtp_available = any(
-            hasattr(pj, name) for name in ("PJMEDIA_HAS_ZRTP", "ZRTP", "ZrtpInfo")
-        )
-        self.zrtp_enabled = self.zrtp_config["enabled"] and self.zrtp_available
-        self._zrtp_state = {}
 
         self.theme_name = self.config_data.get("theme", "auto")
         if self.theme_name != "auto" and self.theme_name not in THEMES:
@@ -780,12 +846,13 @@ class SoftphoneApp(QMainWindow):
         self._latest_qos = None
         self.qos_history = {"timestamp": [], "jitter": [], "loss": [], "rtt": []}
         self._qos_max_points = 60
-        self.zrtp_label = None
         self._toasts = set()
 
         self._sip_available = pj is not None
 
-        os.environ.setdefault("SDL_VIDEODRIVER", "x11")
+        os.environ.setdefault(
+            "SDL_VIDEODRIVER", "x11" if self._qt_x11() else "wayland"
+        )
 
         # ---- UI principal ----
         self._build_ui()
@@ -809,6 +876,8 @@ class SoftphoneApp(QMainWindow):
         QTimer.singleShot(50, self.loop)
         if getattr(self, "_audio_warning", None):
             QTimer.singleShot(1200, self._show_audio_warning)
+        if getattr(self, "_video_warning", None):
+            QTimer.singleShot(1600, self._show_video_warning)
         _uc = self.config_data.get("updater", {})
         if _uc.get("enabled") and _uc.get("check_on_start", True):
             self._check_updates_async(notify=True)
@@ -863,10 +932,7 @@ class SoftphoneApp(QMainWindow):
         self._config_actions = {}
         for label, fn in (
             ("Configurações...", self.open_settings),
-            ("Codecs...", self.open_codecs),
-            ("Vídeo...", self.open_video),
-            ("Segurança e NAT...", self.open_advanced),
-            ("Provisionamento e Atualização...", self.open_provision),
+            ("Avançado...", self.open_advanced_tabs),
         ):
             a = QAction(label, self)
             a.triggered.connect(fn)
@@ -1074,12 +1140,6 @@ class SoftphoneApp(QMainWindow):
         self.qos_label.setStyleSheet("font-weight:700;")
         active_v.addWidget(self.qos_label)
 
-        self.zrtp_label = QLabel("Cripto: —")
-        self.zrtp_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.zrtp_label.setStyleSheet("font-weight:700;")
-        active_v.addWidget(self.zrtp_label)
-        self._update_zrtp_ui()
-
         bl.addStretch(1)
 
     def _styled_button(self, parent, text, command, color, fg="#FFFFFF", **kw):
@@ -1168,6 +1228,13 @@ class SoftphoneApp(QMainWindow):
         self._warn("Problema de áudio detectado", self._audio_warning)
         self._audio_warning = None
 
+    def _show_video_warning(self):
+        if not getattr(self, "_video_warning", None):
+            return
+        logging.warning("Aviso de vídeo ao usuário: %s", self._video_warning)
+        self._warn("Problema de vídeo detectado", self._video_warning)
+        self._video_warning = None
+
     # =========================
     # PJSIP
     # =========================
@@ -1235,6 +1302,13 @@ class SoftphoneApp(QMainWindow):
             devs = []
             logging.error("Não foi possível enumerar dispositivos de áudio: %s", e)
 
+        self._cached_ins = [
+            f"{index} | {d.name}" for index, d in enumerate(devs) if getattr(d, "inputCount", 0)
+        ]
+        self._cached_outs = [
+            f"{index} | {d.name}" for index, d in enumerate(devs) if getattr(d, "outputCount", 0)
+        ]
+
         if not devs:
             logging.critical("NENHUM dispositivo de áudio PJSIP disponível (0).")
             self._audio_warning = (
@@ -1280,13 +1354,73 @@ class SoftphoneApp(QMainWindow):
         logging.critical("NENHUM dispositivo de áudio pôde ser aberto. Chamadas ficarão mudas.")
 
     def _detect_video_support(self):
+        self._video_workaround_dev = -1
+        self._video_warning = None
         try:
-            self._has_video = self.endpoint.vidDevManager().getDevCount() > 0
+            count = self.endpoint.vidDevManager().getDevCount()
         except Exception as e:
-            self._has_video = False
+            count = 0
             logging.warning("Não foi possível detectar suporte a vídeo: %s", e)
+
+        self._has_video = count > 0
         if not self._has_video:
             logging.info("PJSUA sem dispositivos de vídeo; recursos de vídeo desativados")
+            return
+
+        try:
+            devs = list(self.endpoint.vidDevManager().enumDev2())
+        except Exception as e:
+            devs = []
+            logging.warning("Não foi possível enumerar dispositivos de vídeo: %s", e)
+
+        self._cached_cams = [
+            f"{index} | {d.name}"
+            for index, d in enumerate(devs)
+            if (getattr(d, "dir", 0) & pj.PJMEDIA_DIR_CAPTURE)
+        ]
+        self._cached_screen = -1
+        for index, d in enumerate(devs):
+            name = str(getattr(d, "name", "") or "").lower()
+            if any(token in name for token in ("screen", "desktop", "x11", "kms", "display")):
+                self._cached_screen = index
+                break
+
+        caps = [
+            d for d in devs
+            if (getattr(d, "dir", 0) & pj.PJMEDIA_DIR_CAPTURE)
+            and getattr(d, "id", -1) >= 0
+        ]
+        if not caps:
+            self._video_warning = (
+                "Foram encontrados dispositivos de vídeo, mas nenhuma câmera "
+                "de captura disponível. O envio de vídeo estará desativado."
+            )
+            logging.warning("%s", self._video_warning)
+            return
+
+        # NOTA (fix): este build do PJSIP NÃO libera o dispositivo V4L2 no
+        # VideoPreview.stop() — a câmera aberta fica presa pro resto do processo,
+        # e qualquer reabertura (prévia manual ou vídeo de chamada) dá "ocupado".
+        # Por isso NÃO abrimos a câmera aqui num probe; apenas enumeramos e
+        # escolhemos a melhor captura disponível. Ela é aberta sob demanda
+        # (prévia manual / chamada), quando é a primeira (e única) abertura.
+        saved = (self.config_data.get("video") or {}).get("device", -1)
+        if not isinstance(saved, int):
+            saved = -1
+        ids = [d.id for d in caps]
+        chosen = -1
+        for pid in (saved, 0):
+            if pid >= 0 and pid in ids:
+                chosen = pid
+                break
+        if chosen < 0:
+            chosen = ids[0]
+        self._video_workaround_dev = chosen
+        logging.info(
+            "Câmera disponível (id=%d); vídeo automático habilitado "
+            "(aberta sob demanda p/ não travar a prévia)",
+            chosen,
+        )
 
     def _create_tls_transport(self):
         sec = self.config_data.get("security") or {}
@@ -1362,7 +1496,6 @@ class SoftphoneApp(QMainWindow):
         self.refresh()
         self.refresh_favorites()
         self.update_call_ui()
-        self._update_zrtp_ui()
         if getattr(self, "_dark_action", None) is not None:
             self._dark_action.setChecked(active_theme() == "dark")
         self.show_toast("Tema aplicado")
@@ -1634,33 +1767,30 @@ class SoftphoneApp(QMainWindow):
         self._call_box_timer_item.setText(f"⏱  {self._format_call_time(start)}")
 
     def load_devices(self):
-        if self.endpoint is None:
-            return
-        try:
-            devs = self.endpoint.audDevManager().enumDev2()
-        except Exception as e:
-            logging.error("Erro ao listar dispositivos: %s", e)
-            return
-        ins, outs = [], []
-        for index, d in enumerate(devs):
-            if d.inputCount:
-                ins.append(f"{index} | {d.name}")
-            if d.outputCount:
-                outs.append(f"{index} | {d.name}")
+        ins = list(self._cached_ins)
+        outs = list(self._cached_outs)
+        cams = list(self._cached_cams)
+        screen_idx = self._cached_screen
+        if self.endpoint is not None and not (ins or outs or cams):
+            try:
+                devs = self.endpoint.audDevManager().enumDev2()
+                ins = [f"{i} | {d.name}" for i, d in enumerate(devs) if getattr(d, "inputCount", 0)]
+                outs = [f"{i} | {d.name}" for i, d in enumerate(devs) if getattr(d, "outputCount", 0)]
+            except Exception as e:
+                logging.error("Erro ao listar dispositivos: %s", e)
         if self.settings_win is not None:
             self.input_devices.clear()
             self.input_devices.addItems(ins)
             self.output_devices.clear()
             self.output_devices.addItems(outs)
         if self.video_win is not None:
-            cams = []
-            try:
-                vdevs = self.endpoint.vidDevManager().enumDev2()
-                for index, d in enumerate(vdevs):
-                    if d.dir & pj.PJMEDIA_DIR_CAPTURE:
-                        cams.append(f"{index} | {d.name}")
-            except Exception as e:
-                logging.error("Erro ao listar câmeras: %s", e)
+            if self.endpoint is not None and not cams:
+                try:
+                    vdevs = self.endpoint.vidDevManager().enumDev2()
+                    cams = [f"{i} | {d.name}" for i, d in enumerate(vdevs)
+                            if getattr(d, "dir", 0) & pj.PJMEDIA_DIR_CAPTURE]
+                except Exception as e:
+                    logging.error("Erro ao listar câmeras: %s", e)
             self.video_devices.clear()
             self.video_devices.addItems(cams)
             saved = (self.config_data.get("video") or {}).get("device", -1)
@@ -1669,13 +1799,19 @@ class SoftphoneApp(QMainWindow):
                     self.video_devices.setCurrentText(label)
                     break
             if self.btn_screen_share is not None:
-                self.btn_screen_share.set_enabled(self._find_screen_device() >= 0)
+                self.btn_screen_share.set_enabled(screen_idx >= 0)
 
     def _selected_camera(self):
         try:
             return int(self.video_devices.currentText().split(" | ")[0])
         except (ValueError, AttributeError):
             return -1
+
+    def _qt_x11(self):
+        try:
+            return self.qapp.platformName() == "xcb"
+        except Exception:
+            return False
 
     def auto_register_accounts(self):
         if not self._sip_available:
@@ -1891,16 +2027,6 @@ class SoftphoneApp(QMainWindow):
                     acfg.mediaConfig.srtpSecureSignaling = 0
             except Exception as e:
                 logging.warning("Não foi possível aplicar SRTP na conta: %s", pj_error_text(e))
-        if self.zrtp_enabled:
-            try:
-                acfg.mediaConfig.zrtpEnabled = True
-                acfg.mediaConfig.zrtpSasRequired = self.zrtp_config["sas_required"]
-                acfg.mediaConfig.zrtpAllowUnencrypted = self.zrtp_config["allow_unencrypted"]
-                logging.info("ZRTP habilitado para %s", acfg.idUri)
-            except AttributeError:
-                self.zrtp_available = False
-                self.zrtp_enabled = False
-                logging.warning("ZRTP não está disponível neste build do PJSIP")
 
     def _apply_nat_config(self, acfg):
         nat = self.config_data.get("nat") or {}
@@ -1940,11 +2066,25 @@ class SoftphoneApp(QMainWindow):
     def _apply_video_config(self, acfg):
         try:
             vcfg = acfg.videoConfig
-            vcfg.autoShowIncoming = True
-            vcfg.autoTransmitOutgoing = True
-            vid = (self.config_data.get("video") or {}).get("device", -1)
-            if isinstance(vid, int) and vid >= 0:
-                vcfg.defaultCaptureDevice = vid
+            usable = getattr(self, "_video_workaround_dev", -1)
+            if usable >= 0:
+                vcfg.autoShowIncoming = True
+                vcfg.autoTransmitOutgoing = True
+                vcfg.defaultCaptureDevice = usable
+            else:
+                # Sem câmera que abra de verdade: NÃO ativar vídeo automático.
+                # Com autoTransmitOutgoing ligado, uma chamada de entrada cujo
+                # SDP ofereça vídeo faz o PJSIP abrir a câmera durante a
+                # inicialização da mídia; se a abertura falhar (BigLinux:
+                # V4L2/PipeWire sem permissão, device id salvo inválido etc.),
+                # o INVITE é rejeitado com 4xx/5xx ANTES do callback do app —
+                # quem liga ouve "ocupado" e o softphone nunca toca.
+                vcfg.autoShowIncoming = False
+                vcfg.autoTransmitOutgoing = False
+                try:
+                    vcfg.defaultCaptureDevice = -1
+                except Exception:
+                    pass
         except Exception as e:
             logging.warning("Não foi possível aplicar configuração de vídeo: %s", e)
 
@@ -1995,6 +2135,7 @@ class SoftphoneApp(QMainWindow):
         for w in (self.user, self.server, self.password, self.backup_server):
             w.clear()
         self.auto_register_accounts()
+        self._close_settings()
 
     # =========================
     # EXPORT / IMPORT
@@ -2537,9 +2678,7 @@ class SoftphoneApp(QMainWindow):
         if idx is None or not (0 <= idx < len(self.history)):
             return
         entry = self.history[idx]
-        zrtp_state = self._get_zrtp_state(call)
-        if zrtp_state is not None:
-            entry["secure"] = bool(zrtp_state.get("secure"))
+        entry["secure"] = bool(getattr(call, "secure_media", False))
         kind = entry.get("kind") or ""
         status = entry.get("status") or ""
         if not status:
@@ -3077,85 +3216,11 @@ class SoftphoneApp(QMainWindow):
     def on_call_media_state(self, call):
         if self.conf_active:
             self._add_leg_to_conference(call)
-            if call is self.current_call:
-                self._update_zrtp_ui(call)
         elif call is self.current_call:
             self._connect_call_media(call)
-            self._update_zrtp_ui(call)
             if self.current_audio_media is not None and not self._call_is_confirmed(call):
                 logging.info("Mídia antecipada ativa antes do atendimento; toque local mantido")
         self.update_call_ui()
-
-    def _get_zrtp_state(self, call):
-        if call is None:
-            return None
-        if self.zrtp_available:
-            try:
-                info = call.getInfo()
-                zrtp = getattr(info, "zrtpInfo", None)
-                if zrtp is not None:
-                    secure = bool(getattr(zrtp, "secure", False) or getattr(zrtp, "active", False))
-                    sas = str(getattr(zrtp, "sas", "") or getattr(zrtp, "sasValue", "") or "")
-                    verified = bool(getattr(zrtp, "sasVerified", False) or getattr(zrtp, "verified", False))
-                    return {"secure": secure, "sas": sas, "verified": verified, "kind": "ZRTP"}
-            except Exception:
-                pass
-        return {"secure": bool(getattr(call, "secure_media", False)),
-                "sas": "", "verified": False, "kind": "SRTP"}
-
-    def _update_zrtp_ui(self, call=None):
-        call = call or self.current_call
-        state = self._get_zrtp_state(call)
-        if call is not None:
-            try:
-                self._zrtp_state[call.getId()] = state
-            except Exception:
-                pass
-        label = self.zrtp_label
-        if label is None:
-            return
-        if state is not None and state.get("secure"):
-            kind = state.get("kind") or "SRTP"
-            if kind == "ZRTP":
-                suffix = "Verificado" if state.get("verified") else "confirme o SAS"
-                text = f"Cripto: 🔒 ZRTP {suffix}"
-            else:
-                text = "Cripto: 🔒 SRTP ativo"
-            label.setText(text)
-            label.setStyleSheet(f"font-weight:700; color:{COLOR_SUCCESS};")
-            return
-        sec = self.config_data.get("security") or {}
-        srtp = str(sec.get("srtp") or "disabled")
-        if state is not None:
-            if srtp == "mandatory":
-                label.setText("Cripto: ⚠ SRTP exigido não negociado")
-                label.setStyleSheet(f"font-weight:700; color:{COLOR_WARNING};")
-            else:
-                label.setText("Cripto: 🔓 sem criptografia")
-                label.setStyleSheet(f"font-weight:700; color:{COLOR_WARNING};")
-            return
-        if self.zrtp_available:
-            label.setText("ZRTP: disponível")
-        elif srtp == "mandatory":
-            label.setText("Cripto: SRTP obrigatório")
-        elif srtp == "optional":
-            label.setText("Cripto: SRTP opcional")
-        else:
-            label.setText("Cripto: desativada")
-        label.setStyleSheet(f"font-weight:700; color:{COLOR_MUTED};")
-
-    def _verify_zrtp_sas(self):
-        call = self.current_call
-        verifier = getattr(call, "zrtpSasVerified", None) if call is not None else None
-        if not callable(verifier):
-            self.show_toast("ZRTP não está disponível neste build do PJSIP")
-            return
-        try:
-            verifier(True)
-            self._update_zrtp_ui(call)
-            self.show_toast("SAS ZRTP confirmado")
-        except Exception as e:
-            logging.warning("Falha ao confirmar SAS ZRTP: %s", e)
 
     def set_call_state(self, state):
         self.call_state = state
@@ -3167,8 +3232,6 @@ class SoftphoneApp(QMainWindow):
             self.status_label.setText(f"Status: {label}")
             self.status_dot.setStyleSheet(f"color:{STATUS_COLORS.get(state, COLOR_MUTED)}; font-size:18px; background:transparent;")
             self._sync_call_timer()
-            if state in ("IN_CALL", "HOLD"):
-                self._update_zrtp_ui()
         if state == "INCOMING":
             self._blink_answer(True)
             self._start_ringtone()
@@ -3404,6 +3467,9 @@ class SoftphoneApp(QMainWindow):
         self.password.setEchoMode(QLineEdit.EchoMode.Password)
         self.password.setPlaceholderText("Senha do ramal (guardada no cofre)")
         form.addRow("Senha", self.password)
+        self.backup_server = QLineEdit()
+        self.backup_server.setPlaceholderText("ex.: 10.0.0.2 (opcional)")
+        form.addRow("Servidor de backup", self.backup_server)
         self.btn_save = RoundedButton(self, "💾  Salvar conta", self.save_account, COLOR_SUCCESS,
                                       fg="#FFFFFF", pady=6)
         form.addRow(self.btn_save)
@@ -3639,6 +3705,69 @@ class SoftphoneApp(QMainWindow):
             self.vol_in_label.setText(str(int(self.volume_in)))
 
     # =========================
+    # CONFIGURAÇÕES AVANÇADAS (abas unificadas)
+    # =========================================
+    def open_advanced_tabs(self):
+        if self.advtabs_win is None:
+            win = QDialog(self)
+            win.setWindowTitle("Configurações avançadas")
+            _decorate_window(win)
+            win.resize(620, 720)
+            win.setMinimumSize(560, 620)
+            win.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, False)
+            self.advtabs_win = win
+            self._build_advanced_tabs_ui(win)
+            self.load_devices()
+            self.refresh_codec_list()
+        self.advtabs_win.show()
+        self.advtabs_win.raise_()
+        self.advtabs_win.activateWindow()
+
+    def _build_advanced_tabs_ui(self, win):
+        self._tab_layers = {}
+        lay = QVBoxLayout(win)
+        nb = QTabWidget()
+        lay.addWidget(nb)
+
+        tab_codecs = self._make_scroll_tab(nb, "Codecs")
+        tab_video = self._make_scroll_tab(nb, "Vídeo")
+        tab_seg = self._make_scroll_tab(nb, "Segurança e NAT")
+        tab_prov = self._make_scroll_tab(nb, "Provisionamento e Atualização")
+
+        # ---- Codecs ----
+        inner_codecs = QWidget()
+        tab_codecs.layout().addWidget(inner_codecs)
+        self.codec_win = win
+        self._build_codec_ui(inner_codecs)
+
+        # ---- Vídeo ----
+        vframe = QGroupBox("Vídeo")
+        tab_video.layout().addWidget(vframe)
+        vl = QVBoxLayout(vframe)
+        hint = QLabel(
+            "As configurações de vídeo (câmera, qualidade e prévia) continuam "
+            "na própria janela de Vídeo, que também é usada durante as chamadas "
+            "para exibir o vídeo remoto."
+        )
+        hint.setWordWrap(True)
+        hint.setStyleSheet(f"color:{COLOR_TEXT};")
+        vl.addWidget(hint)
+        btn_open_video = RoundedButton(self, "📹  Abrir configurações de Vídeo...",
+                                       self.open_video, COLOR_PRIMARY, fg="#FFFFFF", pady=6)
+        vl.addWidget(btn_open_video)
+
+        # ---- Segurança e NAT ----
+        inner_seg = QWidget()
+        tab_seg.layout().addWidget(inner_seg)
+        self.adv_win = win
+        self._build_advanced_ui(inner_seg)
+
+        # ---- Provisionamento e Atualização ----
+        inner_prov = QWidget()
+        tab_prov.layout().addWidget(inner_prov)
+        self.prov_win = win
+        self._build_provision_ui(inner_prov)
+
     # SEGURANÇA E NAT (avançado)
     # =========================
     def open_advanced(self):
@@ -3726,31 +3855,6 @@ class SoftphoneApp(QMainWindow):
         self.adv_srtp_tls.setChecked(_as_bool(sec.get("srtp_tls_only")))
         form.addRow(self.adv_srtp_tls)
 
-        sep = QFrame()
-        sep.setFrameShape(QFrame.Shape.HLine)
-        sep.setFrameShadow(QFrame.Shadow.Sunken)
-        lay.addWidget(sep)
-
-        zrtp_lbl = QLabel("ZRTP (criptografia de mídia ponto a ponto)")
-        zrtp_lbl.setStyleSheet(f"font-weight:700; color:{COLOR_PRIMARY_DARK};")
-        lay.addWidget(zrtp_lbl)
-        self.feat_zrtp_enabled = QCheckBox("Habilitar ZRTP (se disponível no PJSIP)")
-        self.feat_zrtp_enabled.setChecked(self.zrtp_config["enabled"])
-        lay.addWidget(self.feat_zrtp_enabled)
-        self.feat_zrtp_sas = QCheckBox("Exigir confirmação SAS")
-        self.feat_zrtp_sas.setChecked(self.zrtp_config["sas_required"])
-        lay.addWidget(self.feat_zrtp_sas)
-        self.feat_zrtp_allow = QCheckBox("Permitir chamadas sem ZRTP")
-        self.feat_zrtp_allow.setChecked(self.zrtp_config["allow_unencrypted"])
-        lay.addWidget(self.feat_zrtp_allow)
-        zrtp_note = QLabel(
-            ("ZRTP ativo no build: %s." % ("sim" if self.zrtp_available else "não"))
-            + (" Use o botão 🔒 na chamada para confirmar o SAS." if self.zrtp_available else
-               " Recompile o PJSIP com suporte a ZRTP para usar.")
-        )
-        zrtp_note.setWordWrap(True)
-        lay.addWidget(zrtp_note)
-
         btn_save = RoundedButton(self, "💾  Salvar segurança/NAT", self._save_advanced,
                                  COLOR_SUCCESS, fg="#FFFFFF", pady=6)
         lay.addWidget(btn_save)
@@ -3797,16 +3901,7 @@ class SoftphoneApp(QMainWindow):
         }
         self.config_data["security"] = sec
         self.config_data["nat"] = nat
-        self.config_data["zrtp"] = {
-            "enabled": bool(self.feat_zrtp_enabled.isChecked()),
-            "sas_required": bool(self.feat_zrtp_sas.isChecked()),
-            "allow_unencrypted": bool(self.feat_zrtp_allow.isChecked()),
-        }
         save_config(self.config_data)
-        self.zrtp_config = _clean_zrtp(self.config_data["zrtp"])
-        self.zrtp_enabled = self.zrtp_config["enabled"] and self.zrtp_available
-        if self.zrtp_config["enabled"] and not self.zrtp_available:
-            self.show_toast("ZRTP não está disponível neste build do PJSIP")
         self._info(
             "Segurança e NAT",
             "Configurações salvas.\n\nTLS, STUN, TURN e SRTP nas contas só terão efeito "
@@ -4583,18 +4678,14 @@ class SoftphoneApp(QMainWindow):
         if frame is None:
             return
         try:
-            xid = frame.xid()
             prm = pj.VideoPreviewOpParam()
             prm.show = True
-            prm.format.type = pj.PJMEDIA_TYPE_VIDEO
-            prm.format.id = pj.PJMEDIA_FORMAT_I420
-            prm.format.width = 640
-            prm.format.height = 360
-            prm.format.fpsNum = 30
-            prm.format.fpsDenum = 1
-            prm.window = _native_video_handle(xid)
+            frame.set_placeholder()
+            frame.get_label().setText("Prévia aberta em janela separada do renderer")
             self._preview = pj.VideoPreview(dev)
             self._preview.start(prm)
+            self._ensure_preview_window_visible()
+            QTimer.singleShot(400, self._fit_preview_area)
             self._mirror_on = bool(self.config_data.get("preview_mirror"))
             if self._mirror_on:
                 try:
@@ -4605,28 +4696,59 @@ class SoftphoneApp(QMainWindow):
             else:
                 self.btn_video_mirror.setText("🪞 Espelhar")
             self.btn_video_preview.setText("Atual. prévia")
-            logging.info("Prévia da câmera %s iniciada", dev)
+            logging.info("Prévia da câmera %s iniciada (janela nativa do renderer)", dev)
         except Exception as e:
             self._preview = None
             self._error("Prévia", f"Não foi possível iniciar a prévia da câmera:\n{e}", self.video_win)
+
+    def _ensure_preview_window_visible(self):
+        """Garante que a janela nativa do renderer (SDL) fique visível.
+
+        Este build do pjsua2 só traz o renderer SDL (sem X11), então a prévia
+        é sempre desenhada numa janela própria do renderer; aqui forçamos a
+        exibição caso ela tenha sido criada escondida e logamos o estado para
+        diagnóstico.
+        """
+        try:
+            win = self._preview.getVideoWindow()
+            if win is None:
+                logging.warning("Prévia iniciada, mas sem janela de vídeo disponível")
+                return
+            info = win.getInfo()
+            logging.info(
+                "Janela de vídeo nativa: show=%s isNative=%s size=%sx%s",
+                info.show, info.isNative, info.size.w, info.size.h,
+            )
+            if not info.show:
+                try:
+                    win.Show(True)
+                except Exception:
+                    pass
+        except Exception as e:
+            logging.warning("Não foi possível inspecionar a janela de vídeo: %s", e)
 
     def _on_preview_area_configure(self, event):
         self._fit_preview_area()
 
     def _fit_preview_area(self):
         frame = getattr(self, "video_preview_frame", None)
-        if frame is None:
+        if frame is None or self._preview is None:
             return
-        if self._preview is not None:
-            try:
-                win = self._preview.getVideoWindow()
-                size = pj.MediaSize()
-                size.w = int(frame.width())
-                size.h = int(frame.height())
-                if size.w > 0 and size.h > 0:
-                    win.setSize(size)
-            except Exception:
-                pass
+        try:
+            win = self._preview.getVideoWindow()
+            size = pj.MediaSize()
+            size.w = int(frame.width())
+            size.h = int(frame.height())
+            if size.w < 200 or size.h < 100:
+                size.w, size.h = 640, 360
+            if size.w > 800:
+                size.h = int(size.h * 800 / size.w)
+                size.w = 800
+            if size.w > 0 and size.h > 0:
+                win.setSize(size)
+                logging.info("Prévia redimensionada para %sx%s", size.w, size.h)
+        except Exception as e:
+            logging.debug("Não foi possível ajustar a prévia: %s", e)
 
     def _toggle_mirror(self):
         if self._preview is None:
@@ -5705,66 +5827,69 @@ class SoftphoneApp(QMainWindow):
             win.resize(520, 600)
             win.setMinimumSize(480, 520)
             self.prov_win = win
-            lay = QVBoxLayout(win)
-
-            prov_group = QGroupBox("Auto-provisioning")
-            lay.addWidget(prov_group)
-            pv = QFormLayout(prov_group)
-            pc = (self.config_data.get("provisioning") or {})
-            self.prov_enabled = QCheckBox("Habilitar provisioning remoto")
-            self.prov_enabled.setChecked(bool(pc.get("enabled")))
-            pv.addRow(self.prov_enabled)
-            self.prov_url = QLineEdit(str(pc.get("url") or ""))
-            self.prov_url.setPlaceholderText("https://servidor/provision.json")
-            pv.addRow("URL", self.prov_url)
-            self.prov_user = QLineEdit(str(pc.get("auth_user") or ""))
-            pv.addRow("Usuário", self.prov_user)
-            self.prov_pass = QLineEdit(str(pc.get("auth_pass") or ""))
-            self.prov_pass.setEchoMode(QLineEdit.EchoMode.Password)
-            pv.addRow("Senha", self.prov_pass)
-            self.prov_interval = QSpinBox()
-            self.prov_interval.setRange(60, 86400)
-            self.prov_interval.setValue(int(pc.get("sync_interval", 3600)))
-            pv.addRow("Intervalo (s)", self.prov_interval)
-
-            upd_group = QGroupBox("Atualização automática")
-            lay.addWidget(upd_group)
-            uv = QFormLayout(upd_group)
-            uc = (self.config_data.get("updater") or {})
-            self.upd_enabled = QCheckBox("Habilitar checagem de atualização")
-            self.upd_enabled.setChecked(bool(uc.get("enabled")))
-            uv.addRow(self.upd_enabled)
-            self.upd_url = QLineEdit(str(uc.get("url") or ""))
-            self.upd_url.setPlaceholderText("https://raw.githubusercontent.com/USER/REPO/master/version.json")
-            uv.addRow("URL version.json", self.upd_url)
-            self.upd_auth_user = QLineEdit(str(uc.get("auth_user") or ""))
-            uv.addRow("Usuário", self.upd_auth_user)
-            self.upd_check_start = QCheckBox("Checar atualização ao iniciar")
-            self.upd_check_start.setChecked(bool(uc.get("check_on_start", True)))
-            uv.addRow(self.upd_check_start)
-
-            cti_group = QGroupBox("API CTI (integração externa)")
-            lay.addWidget(cti_group)
-            cv = QFormLayout(cti_group)
-            cc = (self.config_data.get("cti") or {})
-            self.cti_enabled = QCheckBox("Habilitar API CTI REST local")
-            self.cti_enabled.setChecked(bool(cc.get("enabled")))
-            cv.addRow(self.cti_enabled)
-            self.cti_port = QSpinBox()
-            self.cti_port.setRange(1, 65535)
-            self.cti_port.setValue(int(cc.get("port", 9020)))
-            cv.addRow("Porta", self.cti_port)
-            self.cti_token = QLineEdit(str(cc.get("token") or ""))
-            self.cti_token.setEchoMode(QLineEdit.EchoMode.Password)
-            self.cti_token.setPlaceholderText("Token opcional (X-Auth-Token)")
-            cv.addRow("Token", self.cti_token)
-
-            btn_save = RoundedButton(self, "💾  Salvar", self._save_provision_settings,
-                                     COLOR_SUCCESS, fg="#FFFFFF", pady=6)
-            lay.addWidget(btn_save)
+            self._build_provision_ui(win)
         self.prov_win.show()
         self.prov_win.raise_()
         self.prov_win.activateWindow()
+
+    def _build_provision_ui(self, win):
+        lay = QVBoxLayout(win)
+
+        prov_group = QGroupBox("Auto-provisioning")
+        lay.addWidget(prov_group)
+        pv = QFormLayout(prov_group)
+        pc = (self.config_data.get("provisioning") or {})
+        self.prov_enabled = QCheckBox("Habilitar provisioning remoto")
+        self.prov_enabled.setChecked(bool(pc.get("enabled")))
+        pv.addRow(self.prov_enabled)
+        self.prov_url = QLineEdit(str(pc.get("url") or ""))
+        self.prov_url.setPlaceholderText("https://servidor/provision.json")
+        pv.addRow("URL", self.prov_url)
+        self.prov_user = QLineEdit(str(pc.get("auth_user") or ""))
+        pv.addRow("Usuário", self.prov_user)
+        self.prov_pass = QLineEdit(str(pc.get("auth_pass") or ""))
+        self.prov_pass.setEchoMode(QLineEdit.EchoMode.Password)
+        pv.addRow("Senha", self.prov_pass)
+        self.prov_interval = QSpinBox()
+        self.prov_interval.setRange(60, 86400)
+        self.prov_interval.setValue(int(pc.get("sync_interval", 3600)))
+        pv.addRow("Intervalo (s)", self.prov_interval)
+
+        upd_group = QGroupBox("Atualização automática")
+        lay.addWidget(upd_group)
+        uv = QFormLayout(upd_group)
+        uc = (self.config_data.get("updater") or {})
+        self.upd_enabled = QCheckBox("Habilitar checagem de atualização")
+        self.upd_enabled.setChecked(bool(uc.get("enabled")))
+        uv.addRow(self.upd_enabled)
+        self.upd_url = QLineEdit(str(uc.get("url") or ""))
+        self.upd_url.setPlaceholderText("https://raw.githubusercontent.com/USER/REPO/master/version.json")
+        uv.addRow("URL version.json", self.upd_url)
+        self.upd_auth_user = QLineEdit(str(uc.get("auth_user") or ""))
+        uv.addRow("Usuário", self.upd_auth_user)
+        self.upd_check_start = QCheckBox("Checar atualização ao iniciar")
+        self.upd_check_start.setChecked(bool(uc.get("check_on_start", True)))
+        uv.addRow(self.upd_check_start)
+
+        cti_group = QGroupBox("API CTI (integração externa)")
+        lay.addWidget(cti_group)
+        cv = QFormLayout(cti_group)
+        cc = (self.config_data.get("cti") or {})
+        self.cti_enabled = QCheckBox("Habilitar API CTI REST local")
+        self.cti_enabled.setChecked(bool(cc.get("enabled")))
+        cv.addRow(self.cti_enabled)
+        self.cti_port = QSpinBox()
+        self.cti_port.setRange(1, 65535)
+        self.cti_port.setValue(int(cc.get("port", 9020)))
+        cv.addRow("Porta", self.cti_port)
+        self.cti_token = QLineEdit(str(cc.get("token") or ""))
+        self.cti_token.setEchoMode(QLineEdit.EchoMode.Password)
+        self.cti_token.setPlaceholderText("Token opcional (X-Auth-Token)")
+        cv.addRow("Token", self.cti_token)
+
+        btn_save = RoundedButton(self, "💾  Salvar", self._save_provision_settings,
+                                 COLOR_SUCCESS, fg="#FFFFFF", pady=6)
+        lay.addWidget(btn_save)
 
     def _save_provision_settings(self):
         if self.prov_win is None:

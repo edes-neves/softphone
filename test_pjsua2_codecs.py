@@ -89,7 +89,7 @@ def main() -> int:
     # ---- 1. Import ---------------------------------------------------------
     try:
         import pjsua2 as pj
-    except Exception as exc:
+    except Exception:
         print("\n[ERRO] Não foi possível importar pjsua2.")
         print("Arquivo __file__ :", getattr(getattr(pj, "__file__", None), "name", "N/A"))
         traceback.print_exc()

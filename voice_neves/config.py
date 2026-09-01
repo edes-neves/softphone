@@ -136,16 +136,6 @@ def _clean_ldap(raw):
 
 
 
-def _clean_zrtp(raw):
-    if not isinstance(raw, dict):
-        raw = {}
-    return {
-        "enabled": _as_bool(raw.get("enabled")),
-        "sas_required": _as_bool(raw.get("sas_required", True)),
-        "allow_unencrypted": _as_bool(raw.get("allow_unencrypted", True)),
-    }
-
-
 
 def _clean_provisioning(raw):
     """Normaliza a seção de provisioning (config remota) da configuração."""
@@ -213,7 +203,6 @@ def _default_config(secrets):
         "presence_list": [],
         "publish_presence": False,
         "ldap": _clean_ldap(None),
-        "zrtp": _clean_zrtp(None),
         "security": _clean_security(None),
         "nat": _clean_nat(None, secrets),
         "video": _clean_video(None),
@@ -283,7 +272,6 @@ def load_config(secrets):
             ],
             "publish_presence": _as_bool(data.get("publish_presence")),
             "ldap": _clean_ldap(data.get("ldap")),
-            "zrtp": _clean_zrtp(data.get("zrtp")),
             "security": _clean_security(data.get("security")),
             "nat": _clean_nat(data.get("nat"), secrets),
             "video": _clean_video(data.get("video")),

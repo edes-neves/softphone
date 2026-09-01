@@ -50,7 +50,7 @@ carrega (sem pjsua2) e os testes da camada pura passam.
 
 O app é **multi-plataforma na camada de UI e lógica pura**:
 
-- **Linux**: funcionalidade completa, including G.729/BCG729, ZRTP, vídeo, LDAP.
+- **Linux**: funcionalidade completa, including G.729/BCG729, vídeo, LDAP.
 - **Windows e macOS**: o app abre, configura contas, edita contatos/histórico,
   aplica tema claro/escuro e persiste config/contatos/histórico. **Chamadas SIP
   ficam desativadas** — ao tentar ligar, mostra *"Backend SIP indisponível
@@ -327,6 +327,50 @@ Se persistir, verifique também:
 3. Envie o log do PJSIP (`~/.local/share/softphone/pjsua.log`) ao suporte.
 
 No Ubuntu 22.04–26.04 não é necessário nenhum passo extra.
+
+## Chamadas de entrada: softphone não toca (quem liga ouve "ocupado")
+
+**Sintoma**: a conta registra e chamadas de saída funcionam, mas chamadas de
+entrada nunca tocam — o chamador escuta sinal de ocupado imediatamente.
+
+**Causa**: no PJSIP, quando chega um INVITE com SDP, a inicialização da mídia
+ocorre **antes** do callback `onIncomingCall` do app. Se essa inicialização
+falhar, o PJSIP responde ao INVITE com um erro 4xx/5xx (ex.: 488, 500) e
+encerra — o softphone nunca é notificado e quem liga ouve ocupado.
+
+Os dois gatilhos conhecidos para essa falha são:
+
+1. **Vídeo automático sem câmera funcional** (mais comum em BigLinux/Arch,
+   onde uma câmera pode ser enumerada mas não abrir — permissão V4L2, PipeWire,
+   ou `device` salvo na config apontando para um id que não existe na máquina).
+   Com `autoTransmitOutgoing` ligado, uma oferta de entrada com `m=video` faz o
+   PJSIP abrir a câmera na inicialização da mídia; se a abertura falha → ocupado.
+2. **Áudio**: o mesmo cenário da seção anterior, durante a inicialização da
+   mídia da chamada de entrada (só nos casos em que o app não conseguiu fazer
+   fallback para um dispositivo de áudio que abra).
+
+**Em versões recentes** o app detecta se a câmera abre de verdade (teste rápido
+de captura na inicialização) e, se nenhuma funcionar, desativa o vídeo
+automático nas contas — impedindo que a chamada de entrada seja rejeitada por
+causa do vídeo. O vídeo manual continua disponível para quem tiver câmera.
+
+**Diagnóstico**: reproduza o problema e envie
+`~/.local/share/softphone/pjsua.log`. A linha decisiva é:
+
+```text
+Error initializing media channel
+```
+
+seguida do status que indica o motivo (ex.: falha abrindo dispositivo de
+vídeo/som).
+
+**Verificações também importantes**:
+
+- Rode uma build que inclua o keep-alive/NAT (commit `154d176`): sem ele, o
+  binding do PJSIP atrás de NAT/firewall expira e o PBX entrega o INVITE após o
+  timeout — que também se manifesta como "não recebe chamadas".
+- Confirme no log o código SIP da resposta ao INVITE de entrada: `486` indica
+  problema de NAT/firewall, `488`/`500` indicam falha de mídia (vídeo/áudio).
 
 ## Suporte a G.729 (BCG729)
 

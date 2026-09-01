@@ -67,13 +67,6 @@ def test_clean_ldap_defaults():
     assert ldap_cfg["sync_interval"] >= 60
 
 
-def test_clean_zrtp():
-    z = config._clean_zrtp({"enabled": "true", "sas_required": False})
-    assert z["enabled"] is True
-    assert z["sas_required"] is False
-    assert z["allow_unencrypted"] is True  # default
-
-
 def test_normalize_accounts_filters_and_stores_passwords():
     sec = FakeSecrets()
     accounts = [

@@ -148,7 +148,6 @@ if _HAS_PJSUA2:
                 self.secure_media = "SAVP" in blob
             except Exception as e:
                 logging.debug("onCallSdpCreated: %s", e)
-            self.app._ui(self.app._update_zrtp_ui, self)
 
         def onCallState(self, prm):
             self.app._ui(self.app.handle_call_state, self, prm)
