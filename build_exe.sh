@@ -64,6 +64,37 @@ log "Removendo libasound/libpulse do bundle (usam-se as do SO)..."
 rm -f dist/VoiceNeves/_internal/libasound* \
       dist/VoiceNeves/_internal/libpulse*
 
+# ---- 3c. Autossuficiência do Qt Xcb (impede erro libxcb-cursor no destino) ---
+# As libs Qt ficam em _internal/PySide6/Qt/lib com RPATH "$ORIGIN", mas as
+# libs xcb (libxcb-cursor.so.0, libX11, libxkbcommon etc.) são coletadas pelo
+# PyInstaller na raiz _internal/. Sem um caminho que aponte para lá, o plugin
+# xcb depende das libs do SO de DESTINO. Em máquinas sem libxcb-cursor0
+# (ex.: Ubuntu 24.04 limpo) o app falha com:
+#   "From 6.5.0, xcb-cursor0 or libxcb-cursor0 is needed to load the Qt xcb..."
+# Ajusta o RPATH das libs Qt para também apontar para a raiz (_internal),
+# tornando o AppImage autossuficiente para video/cursor.
+QT_LIB="dist/VoiceNeves/_internal/PySide6/Qt/lib"
+log "Tornando as libs Qt autossuficientes (rpath += \$ORIGIN/../..)..."
+if [ -d "$QT_LIB" ]; then
+    for f in "$QT_LIB"/libQt6*.so.6; do
+        rp="$(patchelf --print-rpath "$f" 2>/dev/null || true)"
+        case "$rp" in
+            *'$ORIGIN/../..'*) ;;                       # já ajustado
+            *'$ORIGIN'*)
+                patchelf --set-rpath "$rp:$(printf '%s\n' '$ORIGIN/../..')" "$f" ;;
+            *)
+                patchelf --set-rpath "$(printf '%s\n' '$ORIGIN:$ORIGIN/../..')" "$f" ;;
+        esac
+    done
+    # libxcb.so.1 foi renomeada pelo PyInstaller para libxcb-ad31f5a3.so.1.1.0
+    # (em pillow.libs/); cria o soname clássico na raiz para as libs Qt xcb.
+    root_internal="dist/VoiceNeves/_internal"
+    if [ -L "$root_internal/libxcb-ad31f5a3.so.1.1.0" ] && [ ! -e "$root_internal/libxcb.so.1" ]; then
+        ln -s "libxcb-ad31f5a3.so.1.1.0" "$root_internal/libxcb.so.1"
+        log "Criado symlink raiz libxcb.so.1"
+    fi
+fi
+
 # ---- 4. AppImage ------------------------------------------------------------
 APPIMAGETOOL="appimagetool-x86_64.AppImage"
 APPDIR="build/AppDir"
