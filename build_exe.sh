@@ -93,6 +93,33 @@ if [ -d "$QT_LIB" ]; then
         ln -s "libxcb-ad31f5a3.so.1.1.0" "$root_internal/libxcb.so.1"
         log "Criado symlink raiz libxcb.so.1"
     fi
+
+    # Fail-safe: injeta explicitamente as libs xcb do SO na raiz _internal/.
+    # O PyInstaller só coleta a libxcb-cursor se o pacote libxcb-cursor0
+    # estiver instalado DURANTE o build (é o caso da CI após a instalação).
+    # Este bloco garante presença das libs de cursor/video/xkb mesmo que o
+    # PyInstaller não as tenha coletado. Copia apenas as que ainda faltam.
+    log "Injetando libs xcb (cursor/video/xkb) na raiz _internal/ (falta apenas)..."
+    for lib in \
+        libxcb-cursor.so.0 \
+        libxcb.so.1 \
+        libxcb-glx.so.0 libxcb-icccm.so.4 libxcb-image.so.0 \
+        libxcb-keysyms.so.1 libxcb-randr.so.0 libxcb-render.so.0 \
+        libxcb-render-util.so.0 libxcb-shape.so.0 libxcb-shm.so.0 \
+        libxcb-sync.so.1 libxcb-util.so.1 libxcb-xfixes.so.0 \
+        libxcb-xkb.so.1; do
+        if [ -e "$root_internal/$lib" ] || [ -L "$root_internal/$lib" ]; then
+            continue
+        fi
+        # Procura a .so em diretórios comuns (lib64 + lib e subpastas)
+        src="$(find /usr/lib /lib /usr/local/lib -name "$lib" 2>/dev/null | head -n1 || true)"
+        if [ -n "$src" ]; then
+            cp -L "$src" "$root_internal/$lib"
+            log "  + $lib"
+        else
+            log "  (ausente no SO, pulando $lib)"
+        fi
+    done
 fi
 
 # ---- 4. AppImage ------------------------------------------------------------
@@ -127,7 +154,7 @@ Exec=VoiceNeves
 Icon=voiceneves
 Terminal=false
 Categories=Network;Telephony;
-StartupWMClass=Voice Neves
+StartupWMClass=VoiceNeves
 EOF
 
 log "Gerando VoiceNeves-x86_64.AppImage..."
