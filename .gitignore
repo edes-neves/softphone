@@ -18,6 +18,9 @@ sip_config.json
 # AppImage (artefato de build)
 *.AppImage
 
+# Scripts locais de release
+git_push.sh
+
 # Artefatos e ferramentas binárias locais
 AppDir/
 VoiceNeves
