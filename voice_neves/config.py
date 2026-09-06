@@ -44,6 +44,7 @@ def _normalize_accounts(accounts, secrets):
             {
                 "user": user,
                 "server": server,
+                "phone": str(item.get("phone") or "").strip(),
                 "backup_server": backup_server,
                 "forward_unconditional": str(item.get("forward_unconditional") or "").strip(),
                 "forward_busy": str(item.get("forward_busy") or "").strip(),

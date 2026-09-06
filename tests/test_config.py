@@ -162,6 +162,20 @@ def test_normalize_accounts_backup_server():
     assert by_user["300"]["backup_server"] == ""
 
 
+def test_normalize_accounts_phone_preserved_as_typed():
+    sec = FakeSecrets()
+    accounts = [
+        {"user": "100", "server": "pbx", "phone": "(11) 99999-1234"},
+        {"user": "200", "server": "pbx"},  # sem telefone -> default ""
+        {"user": "300", "server": "pbx", "phone": "  5511-2233  "},
+    ]
+    out = config._normalize_accounts(accounts, sec)
+    by_user = {a["user"]: a for a in out}
+    assert by_user["100"]["phone"] == "(11) 99999-1234"  # preservado como digitado
+    assert by_user["200"]["phone"] == ""
+    assert by_user["300"]["phone"] == "5511-2233"        # apenas strip das bordas
+
+
 def test_clean_cti_default():
     c = config._clean_cti(None)
     assert c == {"enabled": False, "port": 9020, "token": ""}

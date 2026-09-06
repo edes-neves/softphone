@@ -135,3 +135,33 @@ def test_extract_sip_identity_invalid():
 
 def test_extract_sip_identity_keeps_plus():
     assert utils.extract_sip_identity("sip:+5511999999999@pbx") == (None, "+5511999999999")
+
+
+def test_format_phone_mobile_with_ddd():
+    assert utils.format_phone("11987654321") == "(11) 98765-4321"
+    assert utils.format_phone("+5511987654321") == "(11) 98765-4321"
+
+
+def test_format_phone_landline_with_ddd():
+    assert utils.format_phone("1123456789") == "(11) 2345-6789"
+
+
+def test_format_phone_short_extension_preserved():
+    assert utils.format_phone("3000") == "3000"
+    assert utils.format_phone("ramal.1") == "ramal.1"
+    assert utils.format_phone("") == ""
+    assert utils.format_phone(None) == ""
+
+
+def test_phone_matches_equal_and_suffix():
+    assert utils.phone_matches("3000", "3000") is True
+    assert utils.phone_matches("11998887777", "(11) 99888-7777") is True
+    assert utils.phone_matches("5511998887777", "998887777") is True  # +55/DDD variando
+    assert utils.phone_matches("+551130318818", "30318818") is True
+    assert utils.phone_matches("", "3000") is False
+    assert utils.phone_matches(None, None) is False
+
+
+def test_phone_matches_avoids_short_false_positive():
+    assert utils.phone_matches("1300", "300") is False  # só 3 dígitos
+    assert utils.phone_matches("300", "1300") is False

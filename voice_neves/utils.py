@@ -94,6 +94,44 @@ def is_valid_extension(value):
 
 
 
+def format_phone(raw):
+    """Formata um número telefônico brasileiro como (DDD) Prefixo-Número.
+
+    Um número com DDD (10/11 dígitos) ganha a máscara brasileira; demais
+    valores são retornados sem alteração (ex.: ramais internos).
+    """
+    original = str(raw or "").strip()
+    digits = re.sub(r"\D", "", original)
+    if len(digits) in (12, 13) and digits.startswith("55"):
+        digits = digits[2:]
+    if len(digits) == 11:
+        return f"({digits[0:2]}) {digits[2:7]}-{digits[7:11]}"
+    if len(digits) == 10:
+        return f"({digits[0:2]}) {digits[2:6]}-{digits[6:10]}"
+    return original
+
+
+
+def phone_matches(caller, contact_number):
+    """Diz se dois números de telefone referem-se ao mesmo contato.
+
+    Compara apenas dígitos e tolera diferenças de DDD/código país (+55) usando
+    casamento por sufixo (com mínimo de 4 dígitos para evitar falsos positivos).
+    """
+    a = re.sub(r"\D", "", str(caller or ""))
+    b = re.sub(r"\D", "", str(contact_number or ""))
+    if not a or not b:
+        return False
+    if a == b:
+        return True
+    if len(b) >= 4 and len(a) > len(b) and a.endswith(b):
+        return True
+    if len(a) >= 4 and len(b) > len(a) and b.endswith(a):
+        return True
+    return False
+
+
+
 def is_valid_server(value):
     return bool(SERVER_RE.match(value or ""))
 

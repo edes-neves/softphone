@@ -17,7 +17,7 @@ from datetime import datetime
 from urllib.parse import quote
 
 from PySide6.QtCore import (
-    Qt, QTimer, QEvent, QObject, Signal, QRectF,
+    Qt, QTimer, QEvent, QObject, Signal, QRectF, QRect, QSize, QPoint,
 )
 from PySide6.QtGui import (
     QAction, QIcon, QColor, QPen, QFont, QCursor, QKeySequence,
@@ -26,9 +26,10 @@ from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QDialog, QMessageBox, QInputDialog,
     QFileDialog, QLabel, QPushButton, QLineEdit, QComboBox, QCheckBox,
     QRadioButton, QSpinBox, QSlider, QListWidget, QListWidgetItem,
-    QTreeWidget, QTreeWidgetItem, QFrame,
+    QTreeWidget, QTreeWidgetItem, QFrame, QLayout,
     QHBoxLayout, QVBoxLayout, QGridLayout, QFormLayout, QGroupBox,
     QTabWidget, QScrollArea, QSizePolicy, QAbstractItemView, QGraphicsDropShadowEffect,
+    QStyle,
 )
 
 from . import sip_backend
@@ -59,7 +60,7 @@ from .runtime import secrets
 from .utils import (
     resource_path, notify_send, is_wayland, appindicator_available,
     clean_extension, is_valid_extension, is_valid_server,
-    build_sip_target, _as_bool,
+    build_sip_target, format_phone, phone_matches, _as_bool,
 )
 from .config import _account_key, _clean_ldap, load_config, save_config
 from .history import load_history, save_history
@@ -419,12 +420,122 @@ def _decorate_window(win, maximize=True):
 # =========================
 # BOTÃO ARREDONDADO (QPushButton estilizado)
 # =========================
+class QFlowLayout(QLayout):
+    """Layout que quebra linha horizontalmente quando falta espaço (estilo flow)."""
+
+    def __init__(self, parent=None, margin=0, h_spacing=-1, v_spacing=-1):
+        super().__init__(parent)
+        if parent is not None:
+            self.setContentsMargins(margin, margin, margin, margin)
+        self._h_spacing = h_spacing
+        self._v_spacing = v_spacing
+        self._items = []
+
+    def addItem(self, item):
+        self._items.append(item)
+
+    def count(self):
+        return len(self._items)
+
+    def itemAt(self, index):
+        if 0 <= index < len(self._items):
+            return self._items[index]
+        return None
+
+    def takeAt(self, index):
+        if 0 <= index < len(self._items):
+            return self._items.pop(index)
+        return None
+
+    def horizontal_spacing(self):
+        if self._h_spacing >= 0:
+            return self._h_spacing
+        return self._smart_spacing(QStyle.PM_LayoutHorizontalSpacing)
+
+    def vertical_spacing(self):
+        if self._v_spacing >= 0:
+            return self._v_spacing
+        return self._smart_spacing(QStyle.PM_LayoutVerticalSpacing)
+
+    def _smart_spacing(self, pm):
+        parent = self.parent()
+        if parent is None:
+            return 6
+        return max(parent.style().pixelMetric(pm), 0)
+
+    def setGeometry(self, rect):
+        super().setGeometry(rect)
+        self._do_layout(rect, test_only=False)
+
+    def sizeHint(self):
+        return self.minimumSize()
+
+    def minimumSize(self):
+        size = QSize(0, 0)
+        for item in self._items:
+            size = size.expandedTo(item.minimumSize())
+        margins = self.contentsMargins()
+        size += QSize(margins.left() + margins.right(), margins.top() + margins.bottom())
+        return size
+
+    def hasHeightForWidth(self):
+        return True
+
+    def heightForWidth(self, width):
+        return self._do_layout(QRect(0, 0, width, 0), test_only=True)
+
+    def expandingDirections(self):
+        return Qt.Orientation(0)
+
+    def _do_layout(self, rect, test_only):
+        margins = self.contentsMargins()
+        avail_w = rect.width() - margins.left() - margins.right()
+        h_spacing = max(self.horizontal_spacing(), 0)
+        v_spacing = max(self.vertical_spacing(), 0)
+
+        rows = []
+        row = []
+        x = 0
+        line_height = 0
+        for item in self._items:
+            item_w = item.sizeHint().width()
+            if row and x + item_w > avail_w:
+                rows.append((row, line_height))
+                row = []
+                x = 0
+                line_height = 0
+            row.append(item)
+            x += item_w + (h_spacing if row and x else 0)
+            line_height = max(line_height, item.sizeHint().height())
+        if row:
+            rows.append((row, line_height))
+
+        y = margins.top()
+        for row, line_height in rows:
+            widths = [it.sizeHint().width() for it in row]
+            extra = avail_w - (sum(widths) + h_spacing * (len(row) - 1))
+            if extra > 0:
+                share, rest = divmod(extra, len(row))
+                widths = [w + share for w in widths]
+                if rest:
+                    widths[-1] += rest
+            if not test_only:
+                x = margins.left()
+                for item, w in zip(row, widths):
+                    item.setGeometry(QRect(QPoint(x, y), QSize(w, line_height)))
+                    x += w + h_spacing
+            y += line_height + v_spacing
+
+        return y + margins.bottom() - margins.top()
+
+
 class RoundedButton(QPushButton):
     """Botão com cantos arredondados. Mantém API parecida com a do original."""
 
     def __init__(
         self, parent, text="", command=None, bg=COLOR_PRIMARY, fg="#FFFFFF",
         font=None, padx=10, pady=8, radius=12, cursor="pointinghand",
+        padding="8px 12px",
     ):
         super().__init__(text, parent)
         self._text = text
@@ -432,6 +543,7 @@ class RoundedButton(QPushButton):
         self._bg = bg
         self._fg = fg
         self._disabled = False
+        self._padding = padding
         if font:
             self.setFont(font)
         self.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
@@ -447,9 +559,10 @@ class RoundedButton(QPushButton):
             bg, fg = COLOR_BTN_DISABLED_BG, COLOR_BTN_DISABLED_FG
         else:
             bg, fg = self._bg, self._fg
-        c = "background: %s; color: %s; border-radius: 12px; border: none; padding: 8px 12px; font-weight: 600;" % (
+        c = "background: %s; color: %s; border-radius: 12px; border: none; padding: %s; font-weight: 600;" % (
             bg,
             fg,
+            self._padding,
         )
         self.setStyleSheet(c)
 
@@ -714,7 +827,7 @@ class SoftphoneApp(QMainWindow):
         self.setWindowTitle(APP_NAME)
         _decorate_window(self, maximize=True)
         self.resize(520, 760)
-        self.setMinimumSize(460, 680)
+        self.setMinimumSize(460, 720)
         self._base_title = APP_NAME
 
         self._icon = QIcon(resource_path("Icone.png"))
@@ -895,6 +1008,24 @@ class SoftphoneApp(QMainWindow):
         self._build_main_area()
         self.load_devices()
 
+    def _call_caller_info(self, call):
+        if call is None:
+            return "", ""
+        try:
+            remote = call.getInfo().remoteUri
+        except Exception:
+            remote = ""
+        number = self._dialable_from_uri(remote)
+        contact = self._find_contact_by_number(remote)
+        name = contact["name"] if contact else ""
+        return number, name
+
+    def _incoming_caller_info(self):
+        call = getattr(self, "incoming_call", None)
+        if call is None:
+            return "", ""
+        return self._call_caller_info(call)
+
     def _setup_menu_bar(self):
         bar = self.menuBar()
 
@@ -927,8 +1058,10 @@ class SoftphoneApp(QMainWindow):
         a_mute = QAction("Mute/Unmute", self)
         a_mute.triggered.connect(self.toggle_mute)
         m_editar.addAction(a_mute)
+        m_contas = m_editar.addMenu("Contas")
+        m_contas.aboutToShow.connect(self._populate_menu_contas)
 
-        m_config = bar.addMenu("Config.")
+        m_config = bar.addMenu("Configurações")
         self._config_actions = {}
         for label, fn in (
             ("Configurações...", self.open_settings),
@@ -960,7 +1093,7 @@ class SoftphoneApp(QMainWindow):
         a_qos.triggered.connect(self.open_qos_graph)
         m_exibir.addAction(a_qos)
 
-        m_recursos = bar.addMenu("Rec.")
+        m_recursos = bar.addMenu("Recursos")
         a_dnd = QAction("DND (não perturbe)", self)
         a_dnd.triggered.connect(self.dial_dnd)
         m_recursos.addAction(a_dnd)
@@ -977,7 +1110,7 @@ class SoftphoneApp(QMainWindow):
         self._auto_answer_action.toggled.connect(self.toggle_auto_answer)
         m_recursos.addAction(self._auto_answer_action)
 
-        m_historico = bar.addMenu("Hist.")
+        m_historico = bar.addMenu("Histórico")
         a_hist = QAction("Ver Histórico", self)
         a_hist.triggered.connect(self.show_history)
         m_historico.addAction(a_hist)
@@ -997,15 +1130,42 @@ class SoftphoneApp(QMainWindow):
         a_sobre.triggered.connect(self.show_about)
         m_ajuda.addAction(a_sobre)
 
+    def _populate_menu_contas(self):
+        menu = self.sender()
+        if menu is None:
+            return
+        menu.clear()
+        for acc in self.config_data.get("accounts", []):
+            key = f"{acc['user']}@{acc['server']}"
+            name = str(acc.get("phone") or "").strip()
+            label = f"{key}  ·  {name}" if name else key
+            act = menu.addAction(label)
+            act.triggered.connect(
+                lambda _=False, k=key: self._edit_account_from_menu(k)
+            )
+
+    def _edit_account_from_menu(self, key):
+        entry = self._entry_by_key(key)
+        if entry is None:
+            self._error("Erro", "Conta não encontrada.")
+            return
+        self.edit_account(entry)
+
     def _on_dark_toggled(self, checked):
         self.theme_name = "dark" if checked else "light"
         self.config_data["theme"] = self.theme_name
         save_config(self.config_data)
         self.apply_theme(self.theme_name)
 
+    def _header_row_layout(self):
+        row = QHBoxLayout()
+        row.setContentsMargins(10, 6, 10, 2)
+        row.addWidget(self._header())
+        return row
+
     def _header(self):
         header = QWidget()
-        header.setStyleSheet(f"background:{COLOR_HEADER};")
+        header.setStyleSheet(f"background:{COLOR_HEADER}; border-radius:12px;")
         header.setFixedHeight(50)
         lay = QHBoxLayout(header)
         lay.setContentsMargins(16, 0, 14, 0)
@@ -1038,7 +1198,7 @@ class SoftphoneApp(QMainWindow):
     def _group(self, title, parent_layout):
         g = QGroupBox(title)
         v = QVBoxLayout(g)
-        v.setContentsMargins(8, 6, 8, 6)
+        v.setContentsMargins(8, 4, 8, 4)
         parent_layout.addWidget(g)
         return g, v
 
@@ -1049,16 +1209,15 @@ class SoftphoneApp(QMainWindow):
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
 
-        outer.addWidget(self._header())
-
+        outer.addLayout(self._header_row_layout())
         body = QScrollArea()
         body.setWidgetResizable(True)
         body.setFrameShape(QFrame.Shape.NoFrame)
         body.setStyleSheet("QScrollArea { background: transparent; border: none; }")
         body_widget = QWidget()
         bl = QVBoxLayout(body_widget)
-        bl.setContentsMargins(8, 8, 8, 8)
-        bl.setSpacing(6)
+        bl.setContentsMargins(4, 2, 4, 4)
+        bl.setSpacing(4)
         body.setWidget(body_widget)
         outer.addWidget(body, 1)
 
@@ -1066,17 +1225,13 @@ class SoftphoneApp(QMainWindow):
         acc_group, acc_v = self._group("Contas SIP", bl)
         self.listbox = QListWidget()
         self.listbox.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
-        self.listbox.setFixedHeight(54)
+        self.listbox.setMinimumHeight(90)
+        self.listbox.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Ignored)
         acc_v.addWidget(self.listbox)
-        row = QHBoxLayout()
-        self.btn_edit = RoundedButton(self, "Editar conta", self.edit_account, COLOR_KEYPAD_BG, COLOR_KEYPAD_FG, pady=4)
-        self.btn_delete = RoundedButton(self, "Deletar conta", self.delete_account, COLOR_KEYPAD_BG, COLOR_KEYPAD_FG, pady=4)
-        row.addWidget(self.btn_edit)
-        row.addWidget(self.btn_delete)
-        acc_v.addLayout(row)
 
         # --- Discagem ---
         dial_group, dial_v = self._group("Discagem", bl)
+        dial_v.setSpacing(4)
 
         num_row = QHBoxLayout()
         num_row.addWidget(QLabel("Número"))
@@ -1089,9 +1244,14 @@ class SoftphoneApp(QMainWindow):
         keypad.setSpacing(4)
         for i, key in enumerate("123456789*0#"):
             r, c = divmod(i, 3)
-            btn = RoundedButton(self, key, lambda k=key: self.on_keypad_press(k), COLOR_KEYPAD_BG, COLOR_KEYPAD_FG, pady=4)
-            btn.setMinimumHeight(38)
+            btn = RoundedButton(self, key, lambda k=key: self.on_keypad_press(k), COLOR_KEYPAD_BG, COLOR_KEYPAD_FG, pady=4, padding="4px 6px")
+            btn.setMinimumHeight(30)
+            btn.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
             keypad.addWidget(btn, r, c)
+        for r in range(4):
+            keypad.setRowStretch(r, 1)
+        for c in range(3):
+            keypad.setColumnStretch(c, 1)
         dial_v.addLayout(keypad)
 
         feat = QHBoxLayout()
@@ -1104,7 +1264,7 @@ class SoftphoneApp(QMainWindow):
         dial_v.addLayout(feat)
 
         self.favorites_frame = QWidget()
-        self.favorites_layout = QHBoxLayout(self.favorites_frame)
+        self.favorites_layout = QFlowLayout(self.favorites_frame)
         self.favorites_layout.setContentsMargins(0, 0, 0, 0)
         dial_v.addWidget(self.favorites_frame)
         self.refresh_favorites()
@@ -1140,7 +1300,8 @@ class SoftphoneApp(QMainWindow):
         self.qos_label.setStyleSheet("font-weight:700;")
         active_v.addWidget(self.qos_label)
 
-        bl.addStretch(1)
+        bl.setStretchFactor(acc_group, 1)
+        bl.setStretchFactor(dial_group, 2)
 
     def _styled_button(self, parent, text, command, color, fg="#FFFFFF", **kw):
         return RoundedButton(parent, text=text, command=command, bg=color, fg=fg, **kw)
@@ -1516,11 +1677,62 @@ class SoftphoneApp(QMainWindow):
             return self.accounts[idx]
         return None
 
-    def edit_account(self):
+    def _config_account_by_key(self, key):
+        user, _, server = key.partition("@")
+        return next((a for a in self.config_data["accounts"]
+                     if a.get("user") == user and a.get("server") == server), None)
+
+    def _entry_by_key(self, key):
+        for entry in self.accounts:
+            data = entry.get("data") or {}
+            if f"{data.get('user')}@{data.get('server')}" == key:
+                return entry
+        acc_cfg = self._config_account_by_key(key)
+        if acc_cfg is None:
+            return None
+        return {"data": dict(acc_cfg), "status": "OFFLINE"}
+
+    def _reload_accounts_combo(self):
+        combo = getattr(self, "combo_accounts", None)
+        if combo is None or self.settings_win is None:
+            return
+        combo.blockSignals(True)
+        combo.clear()
+        combo.addItem("Selecione uma conta SIP...", "")
+        for acc in self.config_data.get("accounts", []):
+            key = f"{acc['user']}@{acc['server']}"
+            combo.addItem(key, key)
+        combo.setCurrentIndex(0)
+        combo.blockSignals(False)
+
+    def edit_selected_account_cfg(self):
+        key = (self.combo_accounts.currentData() or "").strip()
+        if not key:
+            self._info("Nenhuma seleção", "Selecione uma conta SIP salva.")
+            return
+        entry = self._entry_by_key(key)
+        if entry is None:
+            self._error("Erro", "Conta não encontrada.")
+            return
+        self.edit_account(entry)
+
+    def delete_selected_account_cfg(self):
+        key = (self.combo_accounts.currentData() or "").strip()
+        if not key:
+            self._info("Nenhuma seleção", "Selecione uma conta SIP salva.")
+            return
+        entry = self._entry_by_key(key)
+        if entry is None:
+            self._error("Erro", "Conta não encontrada.")
+            return
+        self.delete_account(entry)
+
+    def edit_account(self, entry=None):
         if self.call_state != "IDLE":
             self._warn("Chamada em andamento", "Encerre a chamada atual antes de editar uma conta.")
             return
-        entry = self.selected_account()
+        if entry is None:
+            entry = self.selected_account()
         if entry is None:
             self._info("Nenhuma seleção", "Selecione uma conta na lista.")
             return
@@ -1547,11 +1759,14 @@ class SoftphoneApp(QMainWindow):
 
         self.edit_server = QLineEdit(old_server)
         self.edit_user = QLineEdit(old_user)
+        self.edit_phone = QLineEdit(entry["data"].get("phone", ""))
+        self.edit_phone.setPlaceholderText("Digite o número do telefone")
         self.edit_password = QLineEdit()
         self.edit_password.setEchoMode(QLineEdit.EchoMode.Password)
         self.edit_backup_server = QLineEdit(entry["data"].get("backup_server", ""))
         form.addRow("Servidor", self.edit_server)
         form.addRow("Ramal", self.edit_user)
+        form.addRow("Telefone", self.edit_phone)
         form.addRow("Senha", self.edit_password)
         form.addRow("Servidor de backup", self.edit_backup_server)
 
@@ -1584,18 +1799,21 @@ class SoftphoneApp(QMainWindow):
         if self.edit_win is None:
             return
         entry = self._edit_entry if self._edit_entry is not None else self.selected_account()
-        if entry is None or entry not in self.accounts:
+        if entry is None:
             self._error("Erro", "Conta não encontrada na lista.")
             return
-
-        old_user = entry["data"]["user"]
-        old_server = entry["data"]["server"]
-        old_key = f"{old_user}@{old_server}"
+        old_key = f"{entry['data']['user']}@{entry['data']['server']}"
+        if entry not in self.accounts and not any(
+            _account_key(a) == old_key for a in self.config_data["accounts"]
+        ):
+            self._error("Erro", "Conta não encontrada na lista.")
+            return
 
         user = clean_extension(self.edit_user.text())
         server = self.edit_server.text().strip()
         password = self.edit_password.text()
         backup_server = self.edit_backup_server.text().strip()
+        phone = self.edit_phone.text().strip()
 
         if not is_valid_extension(user):
             self._error("Erro", "Ramal inválido (use apenas letras, números, _ . + -).")
@@ -1635,41 +1853,51 @@ class SoftphoneApp(QMainWindow):
         for i, acc_cfg in enumerate(self.config_data["accounts"]):
             if _account_key(acc_cfg) == old_key:
                 self.config_data["accounts"][i] = {
-                    "user": user, "server": server, "backup_server": backup_server, **forward_data,
+                    "user": user, "server": server, "backup_server": backup_server,
+                    "phone": phone, **forward_data,
                 }
                 break
 
         save_config(self.config_data)
-        try:
-            entry["acc"].delete()
-        except Exception as e:
-            logging.warning("Erro ao remover conta antiga do pjsip: %s", e)
-        self.accounts.remove(entry)
+        acc_old = entry.get("acc")
+        if acc_old is not None:
+            try:
+                acc_old.delete()
+            except Exception as e:
+                logging.warning("Erro ao remover conta antiga do pjsip: %s", e)
+        if entry in self.accounts:
+            self.accounts.remove(entry)
 
         if self.edit_win is not None:
             self.edit_win.close()
         self.edit_win = None
         self._edit_entry = None
+        self._reload_accounts_combo()
         self.auto_register_accounts()
 
-    def delete_account(self):
+    def delete_account(self, entry=None):
         if self.call_state != "IDLE":
             self._warn("Chamada em andamento", "Encerre a chamada atual antes de deletar uma conta.")
             return
-        entry = self.selected_account()
+        if entry is None:
+            entry = self.selected_account()
         if entry is None:
             self._info("Nenhuma seleção", "Selecione uma conta na lista.")
             return
         user, server = entry["data"]["user"], entry["data"]["server"]
-        try:
-            entry["acc"].delete()
-        except Exception as e:
-            logging.warning("Erro ao remover conta do pjsip: %s", e)
-        self.accounts.remove(entry)
+        acc = entry.get("acc")
+        if acc is not None:
+            try:
+                acc.delete()
+            except Exception as e:
+                logging.warning("Erro ao remover conta do pjsip: %s", e)
+        if entry in self.accounts:
+            self.accounts.remove(entry)
         self.config_data["accounts"] = [a for a in self.config_data["accounts"]
                                         if not (a["user"] == user and a["server"] == server)]
         secrets.delete(f"{user}@{server}")
         save_config(self.config_data)
+        self._reload_accounts_combo()
         self.refresh()
         self.update_presence()
 
@@ -1682,13 +1910,15 @@ class SoftphoneApp(QMainWindow):
             self._populate_accounts()
 
     def _populate_accounts(self):
-        keep_idx = self.listbox.currentRow()
+        sel = self.selected_account()
+        keep_key = f"{sel['data']['user']}@{sel['data']['server']}" if sel else None
         self.listbox.clear()
         status_cfg = {
             "ONLINE": (COLOR_SUCCESS, "●", "ONLINE"),
             "REGISTERING": (COLOR_WARNING, "◐", "REGISTRANDO"),
             "OFFLINE": (COLOR_DANGER, "○", "OFFLINE"),
         }
+        target_row = None
         for i, entry in enumerate(self.accounts):
             status = entry["status"]
             color, icon, label = status_cfg.get(status, (COLOR_MUTED, "○", status))
@@ -1700,11 +1930,20 @@ class SoftphoneApp(QMainWindow):
             primary = (entry.get("data") or {}).get("server", "")
             if used and primary and used != primary:
                 suffix += f"  ({used})"
+            row = self.listbox.count()
+            if keep_key == f"{entry['data']['user']}@{entry['data']['server']}":
+                target_row = row
             item = QListWidgetItem(f"{icon}  {entry['data']['user']}  ({label}){suffix}")
             item.setForeground(QColor(color))
             self.listbox.addItem(item)
-        if keep_idx is not None and 0 <= keep_idx < self.listbox.count():
-            self.listbox.setCurrentRow(keep_idx)
+            phone = (entry.get("data") or {}).get("phone", "")
+            if phone:
+                phone_item = QListWidgetItem(f"      {phone}")
+                phone_item.setForeground(QColor(COLOR_SUCCESS))
+                phone_item.setToolTip("Telefone")
+                self.listbox.addItem(phone_item)
+        if target_row is not None and 0 <= target_row < self.listbox.count():
+            self.listbox.setCurrentRow(target_row)
 
     def _active_caller_display(self):
         call = self.current_call
@@ -1725,19 +1964,43 @@ class SoftphoneApp(QMainWindow):
         self.listbox.clear()
         caller = self._active_caller_display()
         state = self.call_state
-        if state in ("IN_CALL", "HOLD"):
-            color = STATUS_COLORS.get(state, COLOR_PRIMARY)
-            item = QListWidgetItem(f"📞  {caller}")
-            item.setForeground(QColor(color))
-            self.listbox.addItem(item)
-            timer_item = QListWidgetItem("")
-            timer_item.setForeground(QColor(COLOR_TEXT))
-            self.listbox.addItem(timer_item)
-            self._call_box_timer_item = timer_item
-            self._update_active_call_timer()
+        if state == "INCOMING":
+            number, name = self._incoming_caller_info()
+        elif state in ("IN_CALL", "HOLD"):
+            number, name = self._call_caller_info(self.current_call)
+        else:
+            number, name = "", ""
+        if state in ("INCOMING", "IN_CALL", "HOLD"):
+            if number:
+                display = format_phone(number)
+            else:
+                display = name or caller or "Chamada recebida"
+            num_item = QListWidgetItem(f"📞  {display}")
+            num_item.setForeground(QColor("#FFD700"))
+            num_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            font = QFont()
+            font.setPixelSize(14)
+            font.setBold(True)
+            num_item.setFont(font)
+            self.listbox.addItem(num_item)
+            if name:
+                name_item = QListWidgetItem(name)
+                name_item.setForeground(QColor(COLOR_TEXT))
+                name_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                nfont = QFont()
+                nfont.setPixelSize(12)
+                nfont.setBold(True)
+                name_item.setFont(nfont)
+                self.listbox.addItem(name_item)
+            if state in ("IN_CALL", "HOLD"):
+                timer_item = QListWidgetItem("")
+                timer_item.setForeground(QColor(COLOR_TEXT))
+                timer_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                self.listbox.addItem(timer_item)
+                self._call_box_timer_item = timer_item
+                self._update_active_call_timer()
         else:
             status_text = {
-                "INCOMING": "Chamada recebida...",
                 "RINGING": "Tocando...",
                 "CALLING": "Chamando...",
             }.get(state, "")
@@ -2116,6 +2379,7 @@ class SoftphoneApp(QMainWindow):
         server = self.server.text().strip()
         password = self.password.text()
         backup_server = self.backup_server.text().strip()
+        phone = self.phone.text().strip()
         if not is_valid_extension(user):
             self._error("Erro", "Ramal inválido (use apenas letras, números, _ . + -).")
             return
@@ -2130,9 +2394,11 @@ class SoftphoneApp(QMainWindow):
         if password:
             secrets.set(key, password)
         if existing is None:
-            self.config_data["accounts"].append({"user": user, "server": server, "backup_server": backup_server})
+            self.config_data["accounts"].append(
+                {"user": user, "server": server, "backup_server": backup_server, "phone": phone}
+            )
             save_config(self.config_data)
-        for w in (self.user, self.server, self.password, self.backup_server):
+        for w in (self.user, self.server, self.password, self.backup_server, self.phone):
             w.clear()
         self.auto_register_accounts()
         self._close_settings()
@@ -2143,7 +2409,8 @@ class SoftphoneApp(QMainWindow):
     def export_data(self):
         data = {
             "version": 1,
-            "accounts": [{"user": a["user"], "server": a["server"]} for a in self.config_data.get("accounts", [])],
+            "accounts": [{"user": a["user"], "server": a["server"], "phone": str(a.get("phone") or "")}
+                 for a in self.config_data.get("accounts", [])],
             "contacts": self.contacts,
         }
         path, _ = QFileDialog.getSaveFileName(
@@ -2185,7 +2452,9 @@ class SoftphoneApp(QMainWindow):
             key = f"{user}@{server}"
             if key in existing_keys:
                 continue
-            self.config_data.setdefault("accounts", []).append({"user": user, "server": server})
+            self.config_data.setdefault("accounts", []).append(
+                {"user": user, "server": server, "phone": str(item.get("phone") or "").strip()}
+            )
             existing_keys.add(key)
             added_acc += 1
         added_ct = 0
@@ -3463,6 +3732,9 @@ class SoftphoneApp(QMainWindow):
         self.user = QLineEdit()
         self.user.setPlaceholderText("Número do seu ramal")
         form.addRow("Ramal", self.user)
+        self.phone = QLineEdit()
+        self.phone.setPlaceholderText("Digite o número do telefone")
+        form.addRow("Telefone", self.phone)
         self.password = QLineEdit()
         self.password.setEchoMode(QLineEdit.EchoMode.Password)
         self.password.setPlaceholderText("Senha do ramal (guardada no cofre)")
@@ -3473,6 +3745,22 @@ class SoftphoneApp(QMainWindow):
         self.btn_save = RoundedButton(self, "💾  Salvar conta", self.save_account, COLOR_SUCCESS,
                                       fg="#FFFFFF", pady=6)
         form.addRow(self.btn_save)
+
+        # ---- Editar/Deletar conta salva ----
+        edit_frame = QGroupBox("Editar conta")
+        tab_contas.layout().addWidget(edit_frame)
+        ef = QFormLayout(edit_frame)
+        self.combo_accounts = QComboBox()
+        self._reload_accounts_combo()
+        ef.addRow("Conta SIP", self.combo_accounts)
+        cfg_row = QHBoxLayout()
+        self.btn_edit_cfg = RoundedButton(self, "✏️  Editar conta", self.edit_selected_account_cfg,
+                                          COLOR_KEYPAD_BG, COLOR_KEYPAD_FG, pady=4)
+        self.btn_delete_cfg = RoundedButton(self, "🗑  Deletar conta", self.delete_selected_account_cfg,
+                                            COLOR_KEYPAD_BG, COLOR_KEYPAD_FG, pady=4)
+        cfg_row.addWidget(self.btn_edit_cfg)
+        cfg_row.addWidget(self.btn_delete_cfg)
+        ef.addRow(cfg_row)
 
         # ---- Áudio ----
         audio_frame = QGroupBox("Áudio")
@@ -3712,8 +4000,8 @@ class SoftphoneApp(QMainWindow):
             win = QDialog(self)
             win.setWindowTitle("Configurações avançadas")
             _decorate_window(win)
-            win.resize(620, 720)
-            win.setMinimumSize(560, 620)
+            win.resize(620, 750)
+            win.setMinimumSize(560, 720)
             win.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, False)
             self.advtabs_win = win
             self._build_advanced_tabs_ui(win)
@@ -5173,7 +5461,7 @@ class SoftphoneApp(QMainWindow):
         if not num:
             return None
         for c in self.contacts:
-            if clean_extension(c.get("number", "")) == num:
+            if phone_matches(num, c.get("number", "")):
                 return c
         return None
 
@@ -5196,12 +5484,12 @@ class SoftphoneApp(QMainWindow):
                 label = c["name"] if len(c["name"]) <= 14 else c["name"][:13] + "…"
                 btn = RoundedButton(
                     self, f"⭐ {label}", lambda ct=c: self.call_contact(ct),
-                    COLOR_WARNING, fg=COLOR_TEXT, pady=4,
+                    COLOR_WARNING, fg=COLOR_TEXT, pady=2, padding="3px 6px",
                 )
                 self.favorites_layout.addWidget(btn)
                 btn.setToolTip(f"Ligar para {c['name']} ({c['number']})")
         btn = RoundedButton(self, "📒 Contatos", self.open_contacts,
-                            COLOR_PRIMARY, fg="#FFFFFF", pady=3)
+                            COLOR_PRIMARY, fg="#FFFFFF", pady=2, padding="3px 6px")
         btn.setToolTip("Abrir diretório de contatos")
         self.favorites_layout.addWidget(btn)
 
