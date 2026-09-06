@@ -38,6 +38,10 @@ def _prefer_xwayland():
 def main():
     setup_logging()
     _prefer_xwayland()
+    # Desabilita a ponte AT-SPI do Qt para evitar segfault em distribuições
+    # cujo GLib/at-spi é incompatível com o Qt embutido no AppImage.
+    os.environ.setdefault("QT_LINUX_ACCESSIBILITY_ALWAYS_ON", "0")
+    os.environ.setdefault("NO_AT_BRIDGE", "1")
     # Import tardio: so agora o runtime (SecretsStore) e a UI (pjsua2) sao
     # carregados, com o logging ja configurado.
     from PySide6.QtWidgets import QApplication
