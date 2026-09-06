@@ -64,7 +64,16 @@ log "Removendo libasound/libpulse do bundle (usam-se as do SO)..."
 rm -f dist/VoiceNeves/_internal/libasound* \
       dist/VoiceNeves/_internal/libpulse*
 
-# ---- 3c. Autossuficiência do Qt Xcb (impede erro libxcb-cursor no destino) ---
+# ---- 3c. libxkbcommon do SISTEMA (evita segfault em hosts novos) -----------
+# A libxkbcommon empacotada (build Ubuntu 22.04/veículo old Qt) crasha ao
+# processar eventos de teclado em distribuições com GLib/Xwayland/xkb novos
+# (ex.: Ubuntu 26.04) — segfault em xkb_state_key_get_layout. Como o soname
+# .so.0 é ABI estável e todo desktop tem a biblioteca do sistema, removemos a
+# embutida para o runtime usar a do SO de destino.
+log "Removendo libxkbcommon do bundle (usam-se as do SO)..."
+find dist/VoiceNeves -name 'libxkbcommon*.so*' -delete
+
+# ---- 3e. Autossuficiência do Qt Xcb (impede erro libxcb-cursor no destino) ---
 # As libs Qt ficam em _internal/PySide6/Qt/lib com RPATH "$ORIGIN", mas as
 # libs xcb (libxcb-cursor.so.0, libX11, libxkbcommon etc.) são coletadas pelo
 # PyInstaller na raiz _internal/. Sem um caminho que aponte para lá, o plugin
