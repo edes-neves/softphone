@@ -1,6 +1,35 @@
 import os
 
+import pytest
+
 from voice_neves import updater
+
+
+class FakeResp:
+    """Resposta urlopen simulada que drena o buffer a cada read()."""
+
+    def __init__(self, content, headers=None):
+        self._content = content
+        self.headers = headers or {}
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def read(self, n):
+        chunk = self._content[:n]
+        self._content = self._content[n:]
+        return chunk
+
+
+class FakeReq:
+    def __init__(self, *a, **k):
+        pass
+
+    def add_header(self, *a):
+        pass
 
 
 def test_parse_version_and_is_newer():
@@ -42,32 +71,8 @@ def test_download_to_temp_and_checksum(monkeypatch, tmp_path):
     content = b"fake-appimage-content"
     url = "http://x/download/App.AppImage"
 
-    class FakeResp:
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *a):
-            return False
-
-        def read(self, n):
-            # Garante EOF: responde o conteúdo uma vez e depois b"" para o loop
-            # de download de updater.download_to_temp terminar.
-            data = self._buf[:n]
-            self._buf = self._buf[n:]
-            return data
-
-    class FakeReq:
-        def __init__(self, *a, **k):
-            pass
-
-        def add_header(self, *a):
-            pass
-
-    resp = FakeResp()
-    resp._buf = content
-
     def fake_urlopen(req, timeout=10):
-        return resp
+        return FakeResp(content)
 
     monkeypatch.setattr(updater.urllib.request, "urlopen", fake_urlopen)
     monkeypatch.setattr(updater.urllib.request, "Request", FakeReq)
@@ -88,3 +93,54 @@ def test_updater_integration_fake_check(monkeypatch, tmp_path):
     )
     assert up.check("http://x/version.json") is True
     assert up.latest["version"] == "1.1.0"
+
+
+def test_default_download_dir_is_user_downloads():
+    assert updater.default_download_dir().endswith("Downloads")
+
+
+def test_download_to_downloads_with_progress(monkeypatch, tmp_path):
+    content = b"x" * (1 << 21)  # 2 MiB
+    url = "http://x/download/VoiceNeves-1.0.5.exe"
+
+    monkeypatch.setattr(
+        updater.urllib.request, "urlopen",
+        lambda req, timeout=10: FakeResp(content, {"Content-Length": str(len(content))}),
+    )
+    monkeypatch.setattr(updater.urllib.request, "Request", FakeReq)
+    monkeypatch.setattr(updater, "default_download_dir", lambda: str(tmp_path))
+
+    seen = []
+    path = updater.download_to_downloads(url, on_progress=lambda d, t: seen.append((d, t)))
+
+    assert os.path.dirname(path) == str(tmp_path)
+    assert os.path.basename(path) == "VoiceNeves-1.0.5.exe"
+    assert os.path.getsize(path) == len(content)
+    assert seen[0] == (0, len(content))
+    assert seen[-1] == (len(content), len(content))
+
+
+def test_download_canceled_removes_partial(monkeypatch, tmp_path):
+    content = b"x" * 4096
+    url = "http://x/download/VoiceNeves-1.0.5.exe"
+
+    monkeypatch.setattr(
+        updater.urllib.request, "urlopen",
+        lambda req, timeout=10: FakeResp(content),
+    )
+    monkeypatch.setattr(
+        updater.urllib.request, "Request",
+        lambda *a, **k: FakeReq(),
+    )
+    monkeypatch.setattr(updater, "default_download_dir", lambda: str(tmp_path))
+
+    calls = {"n": 0}
+
+    def always_cancel():
+        calls["n"] += 1
+        return True
+
+    with pytest.raises(updater.DownloadCanceled):
+        updater.download_to_downloads(url, cancel_cb=always_cancel)
+    assert calls["n"] == 1
+    assert not list(tmp_path.iterdir())

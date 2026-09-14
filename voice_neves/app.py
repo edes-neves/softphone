@@ -29,7 +29,7 @@ from PySide6.QtWidgets import (
     QTreeWidget, QTreeWidgetItem, QFrame, QLayout,
     QHBoxLayout, QVBoxLayout, QGridLayout, QFormLayout, QGroupBox,
     QTabWidget, QScrollArea, QSizePolicy, QAbstractItemView, QGraphicsDropShadowEffect,
-    QStyle,
+    QStyle, QProgressDialog,
 )
 
 from . import sip_backend
@@ -68,7 +68,7 @@ from .contacts_store import ContactsStore
 from .ldap_manager import LDAPManager
 from .pjsip_models import MyAccount, MyBuddy, MyCall
 from .provisioning import ProvisioningManager, prov_cache_path
-from .updater import Updater, is_newer
+from .updater import DownloadCanceled, Updater, is_newer
 
 
 def pj_error_text(e):
@@ -636,6 +636,27 @@ class RoundedButton(QPushButton):
         if key == "state":
             return "normal" if self._disabled else "disabled"
         return None
+
+
+class DialLineEdit(QLineEdit):
+    """Campo de discagem: ao digitar uma tecla DTMF dá o mesmo feedback
+    visual/sonoro do teclado numérico (flash + tom), reutilizando
+    ``SoftphoneApp._flash_key`` e ``SoftphoneApp._play_key_tone``."""
+
+    def keyPressEvent(self, event):
+        app = getattr(self, "_dial_app", None)
+        if app is not None:
+            try:
+                text = event.text()
+            except Exception:
+                text = ""
+            if text and text in DTMF_FREQS:
+                try:
+                    app._flash_key(text)
+                    app._play_key_tone(text)
+                except Exception:
+                    pass
+        super().keyPressEvent(event)
 
 
 # =========================
@@ -1273,7 +1294,8 @@ class SoftphoneApp(QMainWindow):
 
         num_row = QHBoxLayout()
         num_row.addWidget(QLabel("Número"))
-        self.number = QLineEdit()
+        self.number = DialLineEdit()
+        self.number._dial_app = self
         self.number.returnPressed.connect(self.make_call)
         num_row.addWidget(self.number, 1)
         dial_v.addLayout(num_row)
@@ -6264,8 +6286,13 @@ class SoftphoneApp(QMainWindow):
             pass
 
     def closeEvent(self, event):
-        self.close()
-        event.accept()
+        if HAVE_TRAY and getattr(self, "_tray_icon", None) is not None:
+            event.ignore()
+            self.hide()
+            self.show_toast("Voice Neves continua ativo na bandeja do sistema.")
+        else:
+            self.close()
+            event.accept()
 
     # =========================
     # PROVISIONING / UPDATER / CTI
@@ -6409,21 +6436,80 @@ class SoftphoneApp(QMainWindow):
         if getattr(self, "_update_downloading", False):
             return
         self._update_downloading = True
+        self._update_cancel_event = threading.Event()
+        self._make_update_progress()
 
         def worker():
             try:
                 self._updater.download(
-                    auth_user=(self.config_data.get("updater") or {}).get("auth_user", "")
+                    on_progress=lambda done, total: self._ui(self._update_progress, done, total),
+                    cancel_cb=self._update_cancel_event.is_set,
+                    auth_user=(self.config_data.get("updater") or {}).get("auth_user", ""),
                 )
                 path = self._updater.downloaded_path
+                self._ui(self._close_update_progress)
                 self._ui(self._on_update_downloaded, path)
+            except DownloadCanceled:
+                self._ui(self._close_update_progress)
             except Exception as e:
                 logging.error("Falha ao baixar atualização: %s", e)
+                self._ui(self._close_update_progress)
                 self._ui(self._error, "Atualização", f"Falha ao baixar a atualização:\n{e}")
             finally:
                 self._update_downloading = False
 
         threading.Thread(target=worker, name="updater-download", daemon=True).start()
+
+    def _make_update_progress(self):
+        dlg = QProgressDialog(
+            f"Baixando a nova versão do {APP_NAME}...",
+            "Cancelar",
+            0,
+            1000,
+            self,
+        )
+        dlg.setWindowTitle("Atualização do Voice Neves")
+        dlg.setWindowModality(Qt.WindowModality.WindowModal)
+        dlg.setMinimumDuration(0)
+        dlg.setAutoClose(False)
+        dlg.setAutoReset(False)
+        dlg.setMinimumWidth(380)
+        dlg.setValue(0)
+        dlg.canceled.connect(self._on_update_download_canceled)
+        self._update_progress_dlg = dlg
+        dlg.show()
+        return dlg
+
+    def _on_update_download_canceled(self):
+        try:
+            self._update_cancel_event.set()
+        except Exception:
+            pass
+
+    def _update_progress(self, downloaded, total):
+        dlg = getattr(self, "_update_progress_dlg", None)
+        if dlg is None:
+            return
+        try:
+            if total:
+                dlg.setMaximum(1000)
+                dlg.setValue(min(1000, int(downloaded * 1000 / total)))
+                dlg.setLabelText(f"Baixando... {downloaded // 1024} KB de {total // 1024} KB")
+            else:
+                dlg.setRange(0, 0)
+                dlg.setLabelText("Baixando...")
+        except Exception:
+            pass
+
+    def _close_update_progress(self):
+        dlg = getattr(self, "_update_progress_dlg", None)
+        if dlg is not None:
+            try:
+                dlg.reset()
+                dlg.close()
+            except Exception:
+                pass
+            self._update_progress_dlg = None
 
     def check_updates_menu(self):
         """Ação do menu Configurações → Atualização → Verificar atualização."""

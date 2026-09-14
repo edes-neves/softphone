@@ -1,8 +1,8 @@
 """Atualização automática: checa versão remota e baixa o novo binário.
 
-Camada pura/testável para a lógica de versionamento e download; o instalador é
-baixado para a pasta Downloads do usuário (validado por checksum) e o usuário
-o substitui manualmente, evitando corromper o binário em execução.
+Camada pura/testável para a lógica de versionamento e download; a aplicação do
+binário é feita de forma conservadora (baixar, validar checksum e informar o
+usuário para reiniciar), evitando corromper o binário em execução.
 
 Formato do version.json servido (idealmente junto do provisioning):
 
@@ -19,7 +19,6 @@ import hashlib
 import json
 import os
 import time
-import urllib.error
 import urllib.parse
 import urllib.request
 
@@ -27,11 +26,21 @@ __all__ = [
     "parse_version_info",
     "fetch_version_info",
     "is_newer",
-    "downloads_dir",
     "download_to_temp",
+    "download_to_downloads",
+    "default_download_dir",
+    "downloads_dir",
+    "DownloadCanceled",
     "sha256_file",
     "Updater",
 ]
+
+
+from .platform import downloads_dir  # noqa: E402  (compat: repo antigo expunha via updater)
+
+
+class DownloadCanceled(Exception):
+    """Cancelamento de download solicitado pelo usuário."""
 
 
 # Versão padrão lida do módulo de constantes em runtime (evita import circular).
@@ -42,6 +51,13 @@ def current_version():
         return APP_VERSION
     except Exception:
         return "0.0.0"
+
+
+def default_download_dir():
+    """Pasta Downloads do usuário (~/Downloads; XDG_DOWNLOAD_DIR no Linux)."""
+    from .platform import downloads_dir
+
+    return downloads_dir()
 
 
 def parse_version_info(raw):
@@ -103,29 +119,14 @@ def sha256_file(path, chunk=1 << 20):
     return h.hexdigest()
 
 
-def downloads_dir():
-    """Pasta de Downloads do usuário (destino padrão do instalador).
+def _download(url, dest_dir, on_progress=None, cancel_cb=None, timeout=60, auth_user="", auth_pass=""):
+    """Baixa `url` para `dest_dir` em `nome.partial` e renomeia para `nome`.
 
-    Respeita `XDG_DOWNLOAD_DIR` quando configurado; senão usa ~/Downloads.
+    `on_progress(downloaded, total)` é chamado a cada bloco (total pode ser
+    `None` quando o servidor não informa Content-Length). Se `cancel_cb()`
+    retornar True, o download é abortado, o `.partial` é removido e
+    `DownloadCanceled` é levantado.
     """
-    env = os.environ.get("XDG_DOWNLOAD_DIR")
-    if env and os.path.isabs(env):
-        return os.path.expanduser(env)
-    return os.path.join(os.path.expanduser("~"), "Downloads")
-
-
-def download_to_temp(url, dest_dir=None, timeout=60, auth_user="", auth_pass=""):
-    """Baixa o artefato e retorna o caminho final do arquivo.
-
-    Por padrão o arquivo vai para a pasta Downloads do usuário (`downloads_dir`).
-    Durante o download é usado um sufixo ``.partial`` para nunca deixar um
-    arquivo incompleto com o nome final; no fim ele é renomeado.
-    """
-    dest_dir = dest_dir or downloads_dir()
-    try:
-        os.makedirs(dest_dir, exist_ok=True)
-    except OSError:
-        pass
     req = urllib.request.Request(url)
     if auth_user:
         import base64
@@ -133,14 +134,75 @@ def download_to_temp(url, dest_dir=None, timeout=60, auth_user="", auth_pass="")
         token = base64.b64encode(f"{auth_user}:{auth_pass}".encode()).decode()
         req.add_header("Authorization", f"Basic {token}")
     name = os.path.basename(urllib.parse.urlparse(url).path) or "update.bin"
+    os.makedirs(dest_dir, exist_ok=True)
     dest = os.path.join(dest_dir, f"{name}.partial")
-    with urllib.request.urlopen(req, timeout=timeout) as resp, open(dest, "wb") as out:
-        while True:
-            block = resp.read(1 << 20)
-            if not block:
-                break
-            out.write(block)
-    return dest
+    canceled = False
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp, open(dest, "wb") as out:
+            headers = getattr(resp, "headers", None)
+            total = None
+            try:
+                if headers is not None:
+                    total = int(headers.get("Content-Length") or 0) or None
+            except (TypeError, ValueError):
+                total = None
+            if on_progress is not None:
+                on_progress(0, total)
+            done = 0
+            while True:
+                if cancel_cb is not None and cancel_cb():
+                    canceled = True
+                    break
+                block = resp.read(1 << 20)
+                if not block:
+                    break
+                out.write(block)
+                done += len(block)
+                if on_progress is not None:
+                    on_progress(done, total)
+    finally:
+        if canceled:
+            try:
+                os.remove(dest)
+            except OSError:
+                pass
+            raise DownloadCanceled()
+    # Remove o sufixo ".partial" para um nome de arquivo limpo.
+    final = os.path.splitext(dest)[0]
+    try:
+        os.replace(dest, final)
+    except OSError:
+        final = dest
+    return final
+
+
+def download_to_temp(url, dest_dir=None, timeout=60, auth_user="", auth_pass=""):
+    """Baixa o artefato para um diretório temporário e retorna o caminho."""
+    import tempfile
+
+    dest_dir = dest_dir or tempfile.gettempdir()
+    return _download(
+        url,
+        dest_dir,
+        on_progress=None,
+        cancel_cb=None,
+        timeout=timeout,
+        auth_user=auth_user,
+        auth_pass=auth_pass,
+    )
+
+
+def download_to_downloads(url, on_progress=None, cancel_cb=None, timeout=60, auth_user="", auth_pass=""):
+    """Baixa o artefato para a pasta Downloads do usuário, com progresso."""
+    return _download(
+        url,
+        default_download_dir(),
+        on_progress=on_progress,
+        cancel_cb=cancel_cb,
+        timeout=timeout,
+        auth_user=auth_user,
+        auth_pass=auth_pass,
+    )
 
 
 class Updater:
@@ -159,12 +221,22 @@ class Updater:
         self.last_check = time.time()
         return is_newer(info["version"], self.local_version)
 
-    def download(self, timeout=60, auth_user="", auth_pass=""):
-        """Baixa e valida o artefato; retorna o caminho local pronto."""
+    def download(self, on_progress=None, cancel_cb=None, timeout=60, auth_user="", auth_pass=""):
+        """Baixa e valida o artefato para a pasta Downloads; retorna o caminho.
+
+        `on_progress(downloaded, total)` é chamado durante o download e
+        `cancel_cb()` (retornando True) aborta a operação com
+        `DownloadCanceled`.
+        """
         if self.latest is None:
             raise RuntimeError("Nenhuma atualização checada ainda")
-        path = download_to_temp(
-            self.latest["url"], timeout=timeout, auth_user=auth_user, auth_pass=auth_pass
+        path = download_to_downloads(
+            self.latest["url"],
+            on_progress=on_progress,
+            cancel_cb=cancel_cb,
+            timeout=timeout,
+            auth_user=auth_user,
+            auth_pass=auth_pass,
         )
         if self.latest.get("sha256"):
             actual = sha256_file(path)
@@ -176,11 +248,5 @@ class Updater:
                 raise ValueError(
                     f"Checksum inválido: esperado {self.latest['sha256']}, obtido {actual}"
                 )
-        # Remove o sufixo ".partial" para um nome de arquivo limpo.
-        final = os.path.splitext(path)[0]  # tira ".partial"
-        try:
-            os.replace(path, final)
-        except OSError:
-            final = path
-        self.downloaded_path = final
-        return final
+        self.downloaded_path = path
+        return path

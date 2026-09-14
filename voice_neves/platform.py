@@ -73,6 +73,17 @@ def music_dir():
     return os.path.join(os.path.expanduser("~"), "Music")
 
 
+def downloads_dir():
+    """Pasta Downloads do usuário (~/Downloads em qualquer SO;
+    XDG_DOWNLOAD_DIR no Linux quando definido)."""
+    env = os.environ.get("XDG_DOWNLOAD_DIR")
+    if env:
+        p = os.path.expanduser(env)
+        if os.path.isabs(p):
+            return p
+    return os.path.join(os.path.expanduser("~"), "Downloads")
+
+
 def notify_send(app_name, title, message, urgency="normal"):
     """Envia uma notificação nativa sem bloquear a UI. Falha silenciosa.
 
