@@ -1,0 +1,48 @@
+# ----------------------------------------------------------------------------
+# Dependências PARA WINDOWS (adicional ao requirements.txt)
+#
+# O pjsua2 foi compilado para Windows via build_pjsip_win.ps1.
+# Os artefatos ficam em third_party/pjsip-win/{include,lib,python}.
+#
+# Codecs incluídos no build Windows:
+#   Áudio (nativos + Opus): PCMU, PCMA, G722, L16, G7221, GSM, Speex,
+#                           iLBC, Opus
+#   Vídeo: capture/render via DShow (codecs de vídeo não inclusos no MSVC)
+#   Segurança: SRTP + TLS/SSL (Schannel)
+#
+# G.729, H.263, H.264, VP8/VP9, SILK e AMR exigem libs externas (BCG729,
+# OpenH264, libvpx) que não compilam nativamente em MSVC — ficam desativados.
+#
+# Para compilar o PJSIP no Windows:
+#   1. Execute como Administrador: .\install_win_deps.ps1
+#   2. Execute: .\build_pjsip_win.ps1
+#
+# Instalação dos requisitos gerais (GUI etc.):
+#   pip install -r requirements.txt
+# ----------------------------------------------------------------------------
+
+# --- Gui (obrigatório) -----------------------------------------------------
+PySide6>=6.0
+
+# --- Empacotamento (PyInstaller) -------------------------------------------
+pyinstaller>=6.0
+
+# --- Bandeja do sistema + ícone (opcional) ----------------------------------
+pystray>=0.19
+Pillow>=10.0
+
+# --- Hotkeys globais (opcional) ---------------------------------------------
+pynput>=1.7
+
+# --- Armazenamento seguro de senhas (opcional) ------------------------------
+keyring>=24.0
+
+# --- NOTA sobre pjsua2 ------------------------------------------------------
+# pjsua2 NÃO é distribuído via pip para Windows. O binding é compilado
+# localmente via build_pjsip_win.ps1 e os artefatos ficam em:
+#   third_party/pjsip-win/python/pjsua2.py
+#   third_party/pjsip-win/python/_pjsua2.pyd
+#   third_party/pjsip-win/lib/*.dll
+#
+# O sip_backend.py adiciona automaticamente esses caminhos ao sys.path.
+# Não é necessário instalar nada via pip para o pjsua2.
