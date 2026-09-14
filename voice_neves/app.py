@@ -17,10 +17,10 @@ from datetime import datetime
 from urllib.parse import quote
 
 from PySide6.QtCore import (
-    Qt, QTimer, QEvent, QObject, Signal, QRectF, QRect, QSize, QPoint,
+    Qt, QTimer, QEvent, QObject, Signal, QRectF, QRect, QSize, QPoint, QUrl,
 )
 from PySide6.QtGui import (
-    QAction, QIcon, QColor, QPen, QFont, QCursor, QKeySequence,
+    QAction, QIcon, QColor, QPen, QFont, QCursor, QKeySequence, QDesktopServices,
 )
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QDialog, QMessageBox, QInputDialog,
@@ -62,13 +62,13 @@ from .utils import (
     clean_extension, is_valid_extension, is_valid_server,
     build_sip_target, format_phone, phone_matches, _as_bool,
 )
-from .config import _account_key, _clean_ldap, load_config, save_config
+from .config import _account_key, _clean_ldap, _clean_keepalive, _clean_dtmf, load_config, save_config, DEFAULT_UPDATER_URL
 from .history import load_history, save_history
 from .contacts_store import ContactsStore
 from .ldap_manager import LDAPManager
 from .pjsip_models import MyAccount, MyBuddy, MyCall
 from .provisioning import ProvisioningManager, prov_cache_path
-from .updater import Updater
+from .updater import Updater, is_newer
 
 
 def pj_error_text(e):
@@ -79,6 +79,17 @@ def pj_error_text(e):
         except Exception:
             return str(e) or repr(e)
     return str(e)
+
+
+# Frequências DTMF (sinal multi-frequência usado em telefonia): cada tecla é
+# a soma de dois tons (coluna x linha). Usadas para o feedback sonoro de
+# discagem no teclado do app.
+DTMF_FREQS = {
+    "1": (697, 1209), "2": (697, 1336), "3": (697, 1477),
+    "4": (770, 1209), "5": (770, 1336), "6": (770, 1477),
+    "7": (852, 1209), "8": (852, 1336), "9": (852, 1477),
+    "*": (941, 1209), "0": (941, 1336), "#": (941, 1477),
+}
 
 
 AUDIODEV_ERRNO_START = 420001
@@ -142,6 +153,16 @@ _ACTIVE_THEME = "light"
 
 def active_theme():
     return _ACTIVE_THEME
+
+
+def secondary_button_fg():
+    """Cor do texto para botões de fundo claro (secundários/aviso).
+
+    No tema escuro o fundo *muted*/*warning* fica claro; troca a letra para
+    escura mantendo o contraste. No tema claro retorna o texto padrão, ou
+    seja, sem nenhuma mudança em relação ao comportamento atual.
+    """
+    return "#111827" if _ACTIVE_THEME == "dark" else COLOR_TEXT
 
 
 def set_theme(name):
@@ -866,6 +887,12 @@ class SoftphoneApp(QMainWindow):
         self._ringtone_player = None
         self._test_player = None
         self._test_stop_timer = None
+        self._keypad_btns = {}
+        self._key_flash_btn = None
+        self._key_anim_timer = None
+        self._key_tonegen = None
+        self._key_tone_sink = None
+        self._key_tone_timer = None
         self._answer_blink_on = False
         self._answer_blink_timer = None
         self._blink_color_primary = True
@@ -992,8 +1019,10 @@ class SoftphoneApp(QMainWindow):
         if getattr(self, "_video_warning", None):
             QTimer.singleShot(1600, self._show_video_warning)
         _uc = self.config_data.get("updater", {})
-        if _uc.get("enabled") and _uc.get("check_on_start", True):
-            self._check_updates_async(notify=True)
+        if _uc.get("check_on_start", True):
+            # Aguarda a janela ficar visível: notificação/diálogo sobre a UI
+            # (em GNOME/Wayland, mostrar antes de a janela existir não aparece).
+            QTimer.singleShot(3000, lambda: self._check_updates_async(notify=True))
         self._start_cti()
 
     def main_window(self):
@@ -1070,6 +1099,15 @@ class SoftphoneApp(QMainWindow):
             a = QAction(label, self)
             a.triggered.connect(fn)
             m_config.addAction(a)
+
+        m_update = m_config.addMenu("Atualização")
+        m_update.setToolTipsVisible(True)
+        a_check = QAction("Verificar atualização...", self)
+        a_check.triggered.connect(self.check_updates_menu)
+        m_update.addAction(a_check)
+        a_github = QAction("Consultar no GitHub...", self)
+        a_github.triggered.connect(self.open_updater_github)
+        m_update.addAction(a_github)
 
         m_exibir = bar.addMenu("Exibir")
         a_rereg = QAction("Re-registrar Contas", self)
@@ -1242,12 +1280,14 @@ class SoftphoneApp(QMainWindow):
 
         keypad = QGridLayout()
         keypad.setSpacing(4)
+        self._keypad_btns = {}
         for i, key in enumerate("123456789*0#"):
             r, c = divmod(i, 3)
             btn = RoundedButton(self, key, lambda k=key: self.on_keypad_press(k), COLOR_KEYPAD_BG, COLOR_KEYPAD_FG, pady=4, padding="4px 6px")
             btn.setMinimumHeight(30)
             btn.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
             keypad.addWidget(btn, r, c)
+            self._keypad_btns[key] = btn
         for r in range(4):
             keypad.setRowStretch(r, 1)
         for c in range(3):
@@ -1277,7 +1317,7 @@ class SoftphoneApp(QMainWindow):
         dial_v.addLayout(call_row)
 
         media_row = QHBoxLayout()
-        self.btn_mute = RoundedButton(self, "Mute", self.toggle_mute, COLOR_WARNING, COLOR_TEXT, pady=4)
+        self.btn_mute = RoundedButton(self, "Mute", self.toggle_mute, COLOR_WARNING, secondary_button_fg(), pady=4)
         self.btn_record = RoundedButton(self, "⏺  Gravar", self.toggle_record, COLOR_KEYPAD_BG, COLOR_KEYPAD_FG, pady=4)
         self.btn_video = RoundedButton(self, "📹  Vídeo", self.toggle_video, COLOR_KEYPAD_BG, COLOR_KEYPAD_FG, pady=4)
         media_row.addWidget(self.btn_mute)
@@ -2297,8 +2337,16 @@ class SoftphoneApp(QMainWindow):
         # Keep-Alive UDP: envia CRLF periódico no transporte para manter o
         # mapeamento NAT/firewall aberto. Essencial p/ receber chamadas quando
         # o app está atrás de NAT/firewall (binding expirava -> "ocupado").
+        # O usuário controla ligar/desligar e o intervalo em Configurações.
+        ka = self.config_data.get("keepalive") or {}
+        ka_sec = 0
+        if _as_bool(ka.get("enabled", True)):
+            try:
+                ka_sec = max(0, int(ka.get("interval_sec", 15)))
+            except (TypeError, ValueError):
+                ka_sec = 15
         try:
-            nc.udpKaIntervalSec = 15
+            nc.udpKaIntervalSec = ka_sec
         except Exception as e:
             logging.warning("Não foi possível configurar keep-alive UDP: %s", e)
         # Reescreve Contact/Via/SDP com o endereço detectado (NAT), para o
@@ -2492,13 +2540,156 @@ class SoftphoneApp(QMainWindow):
     # CHAMADAS
     # =========================
     def on_keypad_press(self, digit):
+        self._flash_key(digit)
+        self._play_key_tone(digit)
         if self.current_call is not None and self.call_state == "IN_CALL":
             try:
-                self.current_call.dialDtmf(digit)
+                self._send_dtmf(digit)
             except Exception as e:
                 logging.error("Erro ao enviar DTMF: %s", e)
             return
         self.number.insert(digit)
+
+    def _flash_key(self, digit):
+        """Destaca a tecla pressionada por um instante (feedback visual)."""
+        btn = self._keypad_btns.get(digit)
+        if btn is None:
+            return
+        if self._key_anim_timer is not None:
+            try:
+                self._key_anim_timer.stop()
+            except Exception:
+                pass
+            if self._key_flash_btn is not None:
+                try:
+                    self._key_flash_btn._apply_style()
+                except Exception:
+                    pass
+        self._key_flash_btn = btn
+        highlight = QColor(COLOR_PRIMARY).lighter(115).name()
+        btn.setStyleSheet(
+            "background: %s; color: #FFFFFF; border-radius: 12px; border: none; "
+            "padding: %s; font-weight: 600;" % (highlight, btn._padding)
+        )
+        self._key_anim_timer = QTimer(self)
+        self._key_anim_timer.setSingleShot(True)
+        self._key_anim_timer.timeout.connect(self._restore_key_style)
+        self._key_anim_timer.start(140)
+
+    def _restore_key_style(self):
+        if self._key_flash_btn is not None:
+            try:
+                self._key_flash_btn._apply_style()
+            except Exception:
+                pass
+            self._key_flash_btn = None
+        if self._key_anim_timer is not None:
+            try:
+                self._key_anim_timer.stop()
+            except Exception:
+                pass
+            self._key_anim_timer = None
+
+    def _play_key_tone(self, digit):
+        """Toca o tom DTMF da tecla no alto-falante (feedback sonoro)."""
+        freq = DTMF_FREQS.get(digit)
+        if not freq or pj is None or self.endpoint is None:
+            return
+        try:
+            spk = self.endpoint.audDevManager().getPlaybackDevMedia()
+        except Exception:
+            return
+        try:
+            dtmf = self.config_data.get("dtmf") or {}
+            try:
+                dur = max(40, min(120, int(dtmf.get("duration_ms", 80))))
+            except (TypeError, ValueError):
+                dur = 80
+            if self._key_tonegen is None:
+                tg = pj.ToneGenerator()
+                tg.createToneGenerator(8000)
+                tg.startTransmit(spk)
+                self._key_tonegen = tg
+                self._key_tone_sink = spk
+            desc = pj.ToneDesc()
+            desc.freq1 = freq[0]
+            desc.freq2 = freq[1]
+            desc.on_msec = dur
+            desc.off_msec = 0
+            desc.volume = 0
+            vec = pj.ToneDescVector()
+            vec.push_back(desc)
+            tg = self._key_tonegen
+            try:
+                tg.stop()
+            except Exception:
+                pass
+            tg.play(vec, False)
+            if self._key_tone_timer is not None:
+                try:
+                    self._key_tone_timer.stop()
+                except Exception:
+                    pass
+            self._key_tone_timer = QTimer(self)
+            self._key_tone_timer.setSingleShot(True)
+            self._key_tone_timer.timeout.connect(self._stop_key_tone)
+            self._key_tone_timer.start(dur + 120)
+        except Exception as e:
+            logging.debug("Sem feedback sonoro de tecla: %s", e)
+
+    def _stop_key_tone(self):
+        if self._key_tone_timer is not None:
+            try:
+                self._key_tone_timer.stop()
+            except Exception:
+                pass
+            self._key_tone_timer = None
+        tg = self._key_tonegen
+        if tg is None:
+            return
+        self._key_tonegen = None
+        try:
+            tg.stop()
+        except Exception:
+            pass
+        try:
+            tg.stopTransmit(self._key_tone_sink)
+        except Exception:
+            pass
+        self._key_tone_sink = None
+
+    def _send_dtmf(self, digit):
+        """Envia DTMF respeitando o método e a duração do tom configurados.
+
+        Método RFC 2833 (padrão) usa pacotes de áudio RTP; SIP INFO usa
+        sinalização. Se a API `sendDtmf` do pjsua2 estiver disponível, aplica
+        a duração configurada; caso contrário cai no `dialDtmf` tradicional.
+        """
+        if self.current_call is None:
+            return
+        dtmf = self.config_data.get("dtmf") or {}
+        method = str(dtmf.get("method") or "rfc2833")
+        try:
+            duration = max(0, int(dtmf.get("duration_ms") or 0))
+        except (TypeError, ValueError):
+            duration = 0
+        param = None
+        if pj is not None and hasattr(self.current_call, "sendDtmf"):
+            param = pj.CallSendDtmfParam()
+            param.digits = digit
+        try:
+            if param is not None and method == "sipinfo":
+                param.method = pj.PJSUA_DTMF_METHOD_SIP_INFO
+                self.current_call.sendDtmf(param)
+            elif param is not None and duration:
+                param.method = pj.PJSUA_DTMF_METHOD_RFC2833
+                param.duration = duration
+                self.current_call.sendDtmf(param)
+            else:
+                self.current_call.dialDtmf(digit)
+        except Exception:
+            logging.debug("sendDtmf indisponível; usando dialDtmf", exc_info=True)
+            self.current_call.dialDtmf(digit)
 
     def record_call(self, label, call=None):
         call = call if call is not None else self.current_call
@@ -3679,8 +3870,8 @@ class SoftphoneApp(QMainWindow):
             win = QDialog(self)
             win.setWindowTitle("Configurações")
             _decorate_window(win)
-            win.resize(600, 680)
-            win.setMinimumSize(520, 540)
+            win.resize(650, 650)
+            win.setMinimumSize(620, 640)
             win.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, False)
             self.settings_win = win
             self._build_settings_ui(win)
@@ -3719,6 +3910,8 @@ class SoftphoneApp(QMainWindow):
         tab_contas = self._make_scroll_tab(nb, "Contas")
         tab_audio = self._make_scroll_tab(nb, "Áudio")
         tab_recursos = self._make_scroll_tab(nb, "Recursos")
+        tab_keepalive = self._make_scroll_tab(nb, "Keep-Alive")
+        tab_dtmf = self._make_scroll_tab(nb, "DTMF")
         tab_ldap = self._make_scroll_tab(nb, "LDAP")
         tab_aparencia = self._make_scroll_tab(nb, "Aparência")
 
@@ -3798,7 +3991,7 @@ class SoftphoneApp(QMainWindow):
         self.btn_dev_apply = RoundedButton(self, "Aplicar dispositivos", self.apply_devices, COLOR_PRIMARY,
                                            fg="#FFFFFF", pady=5)
         self.btn_dev_refresh = RoundedButton(self, "Atualizar lista", self.load_devices, COLOR_MUTED,
-                                             fg=COLOR_TEXT, pady=5)
+                                             fg=secondary_button_fg(), pady=5)
         dev_row.addWidget(self.btn_dev_apply)
         dev_row.addWidget(self.btn_dev_refresh)
         alam.addRow(dev_row)
@@ -3811,9 +4004,9 @@ class SoftphoneApp(QMainWindow):
         self.btn_ring_pick = RoundedButton(self, "Procurar...", self._pick_ringtone, COLOR_PRIMARY,
                                            fg="#FFFFFF", pady=5)
         self.btn_ring_test = RoundedButton(self, "Testar", self._test_ringtone, COLOR_MUTED,
-                                           fg=COLOR_TEXT, pady=5)
+                                           fg=secondary_button_fg(), pady=5)
         self.btn_ring_default = RoundedButton(self, "Padrão", self._reset_ringtone, COLOR_MUTED,
-                                              fg=COLOR_TEXT, pady=5)
+                                              fg=secondary_button_fg(), pady=5)
         ring_btns.addWidget(self.btn_ring_pick)
         ring_btns.addWidget(self.btn_ring_test)
         ring_btns.addWidget(self.btn_ring_default)
@@ -3842,6 +4035,64 @@ class SoftphoneApp(QMainWindow):
                                  fg="#FFFFFF", pady=6)
         fl.addRow(btn_feat)
 
+        # ---- Keep-Alive (NAT) ----
+        ka_frame = QGroupBox("Keep-Alive UDP (NAT/firewall)")
+        tab_keepalive.layout().addWidget(ka_frame)
+        kal = QFormLayout(ka_frame)
+        ka_cfg = self.config_data.get("keepalive") or {}
+        self.ka_enabled_var = QCheckBox("Habilitar Keep-Alive (manter a porta aberta no NAT/firewall)")
+        self.ka_enabled_var.setChecked(bool(ka_cfg.get("enabled", True)))
+        kal.addRow(self.ka_enabled_var)
+        self.ka_interval_spin = QSpinBox()
+        self.ka_interval_spin.setRange(1, 3600)
+        self.ka_interval_spin.setValue(int(ka_cfg.get("interval_sec", 15)))
+        self.ka_interval_spin.setSuffix(" s")
+        kal.addRow("Intervalo (segundos)", self.ka_interval_spin)
+        ka_hint = QLabel(
+            "O app envia um pacote (CRLF) no transporte UDP em intervalos periódicos "
+            "para manter o mapeamento de NAT/firewall aberto. Essencial para receber "
+            "chamadas quando o ramal está atrás de rede corporativa. Quando desabilitado, "
+            "nenhum keep-alive é enviado."
+        )
+        ka_hint.setWordWrap(True)
+        ka_hint.setStyleSheet(f"color:{COLOR_TEXT};")
+        kal.addRow(ka_hint)
+        btn_ka = RoundedButton(self, "💾  Salvar Keep-Alive", self._save_keepalive_settings,
+                               COLOR_SUCCESS, fg="#FFFFFF", pady=6)
+        kal.addRow(btn_ka)
+
+        # ---- DTMF ----
+        dtmf_frame = QGroupBox("DTMF (teclas do teclado durante chamadas)")
+        tab_dtmf.layout().addWidget(dtmf_frame)
+        dl = QFormLayout(dtmf_frame)
+        dtmf_cfg = self.config_data.get("dtmf") or {}
+        dtmf_labels = {
+            "rfc2833": "RFC 2833 (pacote de áudio — recomendado)",
+            "sipinfo": "SIP INFO (sinalização SIP)",
+        }
+        self._dtmf_labels = dtmf_labels
+        self.dtmf_method_combo = QComboBox()
+        self.dtmf_method_combo.addItems(list(dtmf_labels.values()))
+        inv_dtmf = {v: k for k, v in dtmf_labels.items()}
+        self.dtmf_method_combo.setCurrentText(inv_dtmf.get(str(dtmf_cfg.get("method") or "rfc2833")))
+        dl.addRow("Método", self.dtmf_method_combo)
+        self.dtmf_duration_spin = QSpinBox()
+        self.dtmf_duration_spin.setRange(80, 1000)
+        self.dtmf_duration_spin.setValue(int(dtmf_cfg.get("duration_ms", 160)))
+        self.dtmf_duration_spin.setSuffix(" ms")
+        dl.addRow("Duração do tom", self.dtmf_duration_spin)
+        dtmf_hint = QLabel(
+            "RFC 2833 envia o tom como pacote de áudio (funciona na maioria dos PBXs). "
+            "SIP INFO envia o dígito como mensagem de sinalização, útil em ramais "
+            "servidos por um PBX que não suporta RFC 2833."
+        )
+        dtmf_hint.setWordWrap(True)
+        dtmf_hint.setStyleSheet(f"color:{COLOR_TEXT};")
+        dl.addRow(dtmf_hint)
+        btn_dtmf = RoundedButton(self, "💾  Salvar DTMF", self._save_dtmf_settings,
+                                 COLOR_SUCCESS, fg="#FFFFFF", pady=6)
+        dl.addRow(btn_dtmf)
+
         # ---- LDAP ----
         ldap_frame = QGroupBox("LDAP corporativo")
         tab_ldap.layout().addWidget(ldap_frame)
@@ -3866,7 +4117,7 @@ class SoftphoneApp(QMainWindow):
         ll.addRow("Intervalo (s)", self.ldap_interval_spin)
         ldap_buttons = QHBoxLayout()
         btn_test = RoundedButton(self, "Testar conexão", self.test_ldap, COLOR_PRIMARY, fg="#FFFFFF", pady=5)
-        btn_sync = RoundedButton(self, "Sincronizar agora", self.sync_ldap_now, COLOR_MUTED, fg=COLOR_TEXT, pady=5)
+        btn_sync = RoundedButton(self, "Sincronizar agora", self.sync_ldap_now, COLOR_MUTED, fg=secondary_button_fg(), pady=5)
         ldap_buttons.addWidget(btn_test)
         ldap_buttons.addWidget(btn_sync)
         ll.addRow(ldap_buttons)
@@ -3900,9 +4151,9 @@ class SoftphoneApp(QMainWindow):
         al.addRow(btn_font)
 
         links = QHBoxLayout()
-        btn_codecs = RoundedButton(self, "🎵 Codecs", self.open_codecs, COLOR_MUTED, fg=COLOR_TEXT, pady=6)
-        btn_video = RoundedButton(self, "📹 Vídeo", self.open_video, COLOR_MUTED, fg=COLOR_TEXT, pady=6)
-        btn_adv = RoundedButton(self, "🔒 Segurança e NAT", self.open_advanced, COLOR_MUTED, fg=COLOR_TEXT, pady=6)
+        btn_codecs = RoundedButton(self, "🎵 Codecs", self.open_codecs, COLOR_PRIMARY, "#FFFFFF", pady=6)
+        btn_video = RoundedButton(self, "📹 Vídeo", self.open_video, COLOR_PRIMARY, "#FFFFFF", pady=6)
+        btn_adv = RoundedButton(self, "🔒 Segurança e NAT", self.open_advanced, COLOR_PRIMARY, "#FFFFFF", pady=6)
         links.addWidget(btn_codecs)
         links.addWidget(btn_video)
         links.addWidget(btn_adv)
@@ -3986,6 +4237,47 @@ class SoftphoneApp(QMainWindow):
             self._auto_answer_action.setChecked(self.auto_answer)
         self._info("Recursos", "Códigos de feature salvos.", self.settings_win)
 
+    def _save_keepalive_settings(self):
+        if self.settings_win is None:
+            return
+        try:
+            interval = max(1, min(3600, int(self.ka_interval_spin.value())))
+        except (TypeError, ValueError):
+            interval = 15
+        enabled = bool(self.ka_enabled_var.isChecked())
+        self.config_data["keepalive"] = _clean_keepalive({"enabled": enabled, "interval_sec": interval})
+        save_config(self.config_data)
+        # Aplica imediatamente re-registrando as contas (sem chamada em curso).
+        if self._sip_available and self.call_state == "IDLE":
+            self.auto_register_accounts()
+            self._info("Keep-Alive", "Configuração de keep-alive salva e aplicada às contas.",
+                       self.settings_win)
+        else:
+            self._info("Keep-Alive",
+                       "Configuração de keep-alive salva.\n\n"
+                       "Como há chamada em andamento, o novo valor será aplicado "
+                       "na próxima vez em que as contas forem registradas "
+                       "(ou ao reiniciar o app).",
+                       self.settings_win)
+
+    def _save_dtmf_settings(self):
+        if self.settings_win is None:
+            return
+        labels = getattr(self, "_dtmf_labels",
+                         {"rfc2833": "RFC 2833 (pacote de áudio — recomendado)",
+                          "sipinfo": "SIP INFO (sinalização SIP)"})
+        inv = {v: k for k, v in labels.items()}
+        method = inv.get(self.dtmf_method_combo.currentText(), "rfc2833")
+        try:
+            duration = max(80, min(1000, int(self.dtmf_duration_spin.value())))
+        except (TypeError, ValueError):
+            duration = 160
+        self.config_data["dtmf"] = _clean_dtmf({"method": method, "duration_ms": duration})
+        save_config(self.config_data)
+        self._info("DTMF", "Configuração de DTMF salva. Os novos dígitos enviados "
+                   "durante chamadas já usam o método e a duração escolhidos.",
+                   self.settings_win)
+
     def _update_volume_labels(self):
         if hasattr(self, "vol_out_label"):
             self.vol_out_label.setText(str(int(self.volume_out)))
@@ -4020,7 +4312,7 @@ class SoftphoneApp(QMainWindow):
         tab_codecs = self._make_scroll_tab(nb, "Codecs")
         tab_video = self._make_scroll_tab(nb, "Vídeo")
         tab_seg = self._make_scroll_tab(nb, "Segurança e NAT")
-        tab_prov = self._make_scroll_tab(nb, "Provisionamento e Atualização")
+        tab_prov = self._make_scroll_tab(nb, "Provisionamento")
 
         # ---- Codecs ----
         inner_codecs = QWidget()
@@ -4050,7 +4342,7 @@ class SoftphoneApp(QMainWindow):
         self.adv_win = win
         self._build_advanced_ui(inner_seg)
 
-        # ---- Provisionamento e Atualização ----
+        # ---- Provisionamento ----
         inner_prov = QWidget()
         tab_prov.layout().addWidget(inner_prov)
         self.prov_win = win
@@ -4128,7 +4420,7 @@ class SoftphoneApp(QMainWindow):
             entry = QLineEdit(str(sec.get(key, "")))
             rh.addWidget(entry, 1)
             btn = RoundedButton(self, "…", lambda e=entry: self._pick_file(e, win),
-                                COLOR_MUTED, fg=COLOR_TEXT, pady=2)
+                                COLOR_MUTED, fg=secondary_button_fg(), pady=2)
             btn.setFixedWidth(34)
             rh.addWidget(btn)
             form.addRow(label, row)
@@ -4498,7 +4790,7 @@ class SoftphoneApp(QMainWindow):
         if not getattr(self, "_answer_blink_on", False):
             return
         if self._blink_color_primary:
-            self.btn_answer.set_color(COLOR_WARNING, COLOR_TEXT)
+            self.btn_answer.set_color(COLOR_WARNING, secondary_button_fg())
             self._blink_color_primary = False
         else:
             self.btn_answer.set_color(COLOR_PRIMARY, "#FFFFFF")
@@ -4701,9 +4993,9 @@ class SoftphoneApp(QMainWindow):
         self.btn_screen_share = RoundedButton(self, "🖥  Compartilhar tela", self._toggle_screen_sharing,
                                               COLOR_PRIMARY, fg="#FFFFFF", pady=5)
         btn_full = RoundedButton(self, "Tela cheia", self._toggle_video_fullscreen,
-                                 COLOR_MUTED, fg=COLOR_TEXT, pady=5)
+                                 COLOR_MUTED, fg=secondary_button_fg(), pady=5)
         btn_snap = RoundedButton(self, "Tirar foto", self._take_video_snapshot,
-                                 COLOR_MUTED, fg=COLOR_TEXT, pady=5)
+                                 COLOR_MUTED, fg=secondary_button_fg(), pady=5)
         toolbar.addWidget(self.btn_screen_share)
         toolbar.addWidget(btn_full)
         toolbar.addWidget(btn_snap)
@@ -4718,11 +5010,11 @@ class SoftphoneApp(QMainWindow):
         self.btn_cam_apply = RoundedButton(self, "Aplicar câmera", self.apply_camera,
                                            COLOR_PRIMARY, fg="#FFFFFF", pady=5)
         self.btn_video_preview = RoundedButton(self, "Ver prévia", self._toggle_preview,
-                                               COLOR_MUTED, fg=COLOR_TEXT, pady=5)
+                                               COLOR_MUTED, fg=secondary_button_fg(), pady=5)
         self.btn_video_preview_close = RoundedButton(self, "Fechar prévia", self._stop_preview,
-                                                     COLOR_MUTED, fg=COLOR_TEXT, pady=5)
+                                                     COLOR_MUTED, fg=secondary_button_fg(), pady=5)
         self.btn_video_mirror = RoundedButton(self, "🪞 Espelhar", self._toggle_mirror,
-                                              COLOR_MUTED, fg=COLOR_TEXT, pady=5)
+                                              COLOR_MUTED, fg=secondary_button_fg(), pady=5)
         cam_btns.addWidget(self.btn_cam_apply)
         cam_btns.addWidget(self.btn_video_preview)
         cam_btns.addWidget(self.btn_video_preview_close)
@@ -5136,7 +5428,7 @@ class SoftphoneApp(QMainWindow):
         btn_down = RoundedButton(self, "Prioridade −", lambda: self._codec_action("down"),
                                  COLOR_PRIMARY, fg="#FFFFFF", pady=5)
         btn_ref = RoundedButton(self, "Atualizar", self.refresh_codec_list,
-                                COLOR_MUTED, fg=COLOR_TEXT, pady=5)
+                                COLOR_MUTED, fg=secondary_button_fg(), pady=5)
         for b in (btn_ena, btn_dis, btn_up, btn_down, btn_ref):
             btns.addWidget(b)
         lay.addLayout(btns)
@@ -5484,7 +5776,7 @@ class SoftphoneApp(QMainWindow):
                 label = c["name"] if len(c["name"]) <= 14 else c["name"][:13] + "…"
                 btn = RoundedButton(
                     self, f"⭐ {label}", lambda ct=c: self.call_contact(ct),
-                    COLOR_WARNING, fg=COLOR_TEXT, pady=2, padding="3px 6px",
+                    COLOR_WARNING, fg=secondary_button_fg(), pady=2, padding="3px 6px",
                 )
                 self.favorites_layout.addWidget(btn)
                 btn.setToolTip(f"Ligar para {c['name']} ({c['number']})")
@@ -5544,7 +5836,7 @@ class SoftphoneApp(QMainWindow):
         btn_new = RoundedButton(self, "➕  Novo", lambda: self.edit_contact(None),
                                 COLOR_SUCCESS, fg="#FFFFFF", pady=5)
         btn_edit = RoundedButton(self, "✏️  Editar", lambda: self.edit_contact(self._selected_contact()),
-                                 COLOR_WARNING, fg=COLOR_TEXT, pady=5)
+                                 COLOR_WARNING, fg=secondary_button_fg(), pady=5)
         btn_del = RoundedButton(self, "🗑  Excluir", lambda: self.delete_contact(self._selected_contact()),
                                 COLOR_DANGER, fg="#FFFFFF", pady=5)
         btn_frame.addWidget(btn_new)
@@ -5671,11 +5963,11 @@ class SoftphoneApp(QMainWindow):
         e_ring = QLineEdit(contact.get("ringtone", "") if editing else "")
         rh.addWidget(e_ring, 1)
         btn_pick = RoundedButton(self, "…", lambda: e_ring.setText(self._pick_ringtone_path(e_ring.text())),
-                                 COLOR_MUTED, fg=COLOR_TEXT, pady=2)
+                                 COLOR_MUTED, fg=secondary_button_fg(), pady=2)
         btn_pick.setFixedWidth(34)
         rh.addWidget(btn_pick)
         btn_x = RoundedButton(self, "✕", lambda: e_ring.setText(""),
-                              COLOR_MUTED, fg=COLOR_TEXT, pady=2)
+                              COLOR_MUTED, fg=secondary_button_fg(), pady=2)
         btn_x.setFixedWidth(34)
         rh.addWidget(btn_x)
         form.addRow("Toque (opcional)", ring_row)
@@ -5939,6 +6231,8 @@ class SoftphoneApp(QMainWindow):
             self._stop_ringback(reason="aplicativo encerrando")
             self._stop_ringtone()
             self._stop_test_player()
+            self._restore_key_style()
+            self._stop_key_tone()
             self._stop_preview()
             self._stop_cti()
             if self.qos_graph_win is not None:
@@ -6060,7 +6354,7 @@ class SoftphoneApp(QMainWindow):
     def _check_updates_async(self, notify=False):
         uc = (self.config_data.get("updater") or {})
         url = str(uc.get("url") or "").strip()
-        if not uc.get("enabled") or not url:
+        if not url:
             return
         if self._update_thread is not None and self._update_thread.is_alive():
             return
@@ -6074,20 +6368,48 @@ class SoftphoneApp(QMainWindow):
                 if available:
                     self._ui(self._on_update_available, self._updater.latest)
                 elif notify:
-                    self._ui(self.show_toast, "Você está na versão mais recente")
+                    self._ui(self._on_update_up_to_date)
             except Exception as e:
                 logging.info("Checagem de atualização falhou: %s", e)
+                if notify:
+                    self._ui(self._on_update_check_failed, str(e))
 
         self._update_thread = threading.Thread(target=worker, name="updater", daemon=True)
         self._update_thread.start()
 
+    def _on_update_up_to_date(self):
+        # Notificação nativa (central de notificações do GNOME), não só o
+        # toast interno que pode passar despercebido/nenhum em Wayland.
+        notify_send("Atualização do Voice Neves", "Você está na versão mais recente.", "low")
+
+    def _on_update_check_failed(self, error):
+        logging.info("Checagem de atualização falhou (exibido ao usuário): %s", error)
+        notify_send(
+            "Atualização do Voice Neves",
+            "Não foi possível verificar atualizações agora (sem internet?).",
+            "low",
+        )
+
     def _on_update_available(self, info):
+        notify_send(
+            "Atualização disponível",
+            f"Nova versão {info.get('version')} do Voice Neves. "
+            "Clique em Configurações → Atualização para baixar.",
+            "normal",
+        )
         if not self._ask_yes(
             "Atualização disponível",
             f"Existe uma nova versão ({info.get('version')}) do Voice Neves.\n\n"
-            "Baixar agora?",
+            "Baixar o instalador para a pasta Downloads agora?",
         ):
             return
+        self._start_update_download()
+
+    def _start_update_download(self):
+        if getattr(self, "_update_downloading", False):
+            return
+        self._update_downloading = True
+
         def worker():
             try:
                 self._updater.download(
@@ -6098,19 +6420,102 @@ class SoftphoneApp(QMainWindow):
             except Exception as e:
                 logging.error("Falha ao baixar atualização: %s", e)
                 self._ui(self._error, "Atualização", f"Falha ao baixar a atualização:\n{e}")
+            finally:
+                self._update_downloading = False
+
         threading.Thread(target=worker, name="updater-download", daemon=True).start()
 
+    def check_updates_menu(self):
+        """Ação do menu Configurações → Atualização → Verificar atualização."""
+        uc = (self.config_data.get("updater") or {})
+        url = str(uc.get("url") or "").strip() or DEFAULT_UPDATER_URL
+        if self._update_thread is not None and self._update_thread.is_alive():
+            self.show_toast("A verificação de atualização já está em andamento")
+            return
+
+        def worker():
+            try:
+                self._updater.check(url, uc.get("auth_user", ""))
+                self._ui(self._on_menu_update_result,
+                         self._updater.latest, self._updater.local_version, None)
+            except Exception as e:
+                logging.info("Checagem de atualização (menu) falhou: %s", e)
+                self._ui(self._on_menu_update_result, None, self._updater.local_version, str(e))
+
+        self._update_thread = threading.Thread(target=worker, name="updater-menu", daemon=True)
+        self._update_thread.start()
+
+    def _on_menu_update_result(self, info, local_version, error):
+        if error:
+            self._error(
+                "Verificar atualização",
+                f"Não foi possível consultar a versão remota:\n\n{error}\n\n"
+                "Verifique sua conexão com a internet.",
+            )
+            return
+        remote = info.get("version") or ""
+        if is_newer(remote, local_version):
+            if self._ask_yes(
+                "Atualização disponível",
+                f"Sua versão atual é a {local_version}.\n"
+                f"Nova versão disponível: {remote}\n\n"
+                "Baixar o instalador para a pasta Downloads?",
+            ):
+                self._start_update_download()
+        else:
+            self._info(
+                "Verificar atualização",
+                f"Você está na versão mais recente ({local_version}).\n\n"
+                "Use 'Configurações → Atualização → Consultar no GitHub' para "
+                "ver as novidades e releases.",
+            )
+
+    def open_updater_github(self):
+        repo = self._updater_repo_url()
+        try:
+            webbrowser.open(repo)
+        except Exception as e:
+            logging.warning("Não foi possível abrir o GitHub: %s", e)
+            self._warn("GitHub", f"Não foi possível abrir o navegador:\n{e}")
+
+    def _updater_repo_url(self):
+        raw = "raw.githubusercontent.com/"
+        candidates = [
+            (self.config_data.get("updater") or {}).get("url") or "",
+            DEFAULT_UPDATER_URL,
+        ]
+        for url in candidates:
+            if raw in url:
+                try:
+                    path = url.split(raw, 1)[1]
+                    owner, repo = path.split("/", 2)[:2]
+                    return f"https://github.com/{owner}/{repo}/releases/latest"
+                except (ValueError, IndexError):
+                    continue
+        return "https://github.com/edes-neves/softphone/releases/latest"
+
     def _on_update_downloaded(self, path):
+        folder = os.path.dirname(path)
+        basename = os.path.basename(path)
         self._info(
-            "Atualização pronta",
-            f"A nova versão foi baixada.\n\n{path}\n\n"
-            "Feche o app e substitua o binário, ou execute-o após fechar para aplicar.",
+            "Atualização baixada",
+            f"O novo instalador foi baixado para a pasta Downloads:\n\n{path}\n\n"
+            "Como aplicar:\n"
+            f"1. Feche o Voice Neves.\n"
+            f"2. Na pasta {folder}, substitua o arquivo atual pelo novo "
+            f"instalador ({basename}).\n"
+            "3. Execute o novo arquivo para concluir a atualização.\n\n"
+            "O download foi validado pelo checksum.",
         )
+        try:
+            QDesktopServices.openUrl(QUrl.fromLocalFile(folder))
+        except Exception as e:
+            logging.debug("Não foi possível abrir a pasta de downloads: %s", e)
 
     def open_provision(self):
         if self.prov_win is None:
             win = QDialog(self)
-            win.setWindowTitle("Provisionamento e Atualização")
+            win.setWindowTitle("Provisionamento")
             _decorate_window(win)
             win.resize(520, 600)
             win.setMinimumSize(480, 520)
@@ -6143,22 +6548,6 @@ class SoftphoneApp(QMainWindow):
         self.prov_interval.setValue(int(pc.get("sync_interval", 3600)))
         pv.addRow("Intervalo (s)", self.prov_interval)
 
-        upd_group = QGroupBox("Atualização automática")
-        lay.addWidget(upd_group)
-        uv = QFormLayout(upd_group)
-        uc = (self.config_data.get("updater") or {})
-        self.upd_enabled = QCheckBox("Habilitar checagem de atualização")
-        self.upd_enabled.setChecked(bool(uc.get("enabled")))
-        uv.addRow(self.upd_enabled)
-        self.upd_url = QLineEdit(str(uc.get("url") or ""))
-        self.upd_url.setPlaceholderText("https://raw.githubusercontent.com/USER/REPO/master/version.json")
-        uv.addRow("URL version.json", self.upd_url)
-        self.upd_auth_user = QLineEdit(str(uc.get("auth_user") or ""))
-        uv.addRow("Usuário", self.upd_auth_user)
-        self.upd_check_start = QCheckBox("Checar atualização ao iniciar")
-        self.upd_check_start.setChecked(bool(uc.get("check_on_start", True)))
-        uv.addRow(self.upd_check_start)
-
         cti_group = QGroupBox("API CTI (integração externa)")
         lay.addWidget(cti_group)
         cv = QFormLayout(cti_group)
@@ -6189,12 +6578,6 @@ class SoftphoneApp(QMainWindow):
             "auth_pass": self.prov_pass.text().strip() or (self.config_data.get("provisioning") or {}).get("auth_pass", ""),
             "sync_interval": int(self.prov_interval.value()),
         }
-        self.config_data["updater"] = {
-            "enabled": bool(self.upd_enabled.isChecked()),
-            "url": self.upd_url.text().strip(),
-            "auth_user": self.upd_auth_user.text().strip(),
-            "check_on_start": bool(self.upd_check_start.isChecked()),
-        }
         self.config_data["cti"] = {
             "enabled": bool(self.cti_enabled.isChecked()),
             "port": int(self.cti_port.value()),
@@ -6205,7 +6588,7 @@ class SoftphoneApp(QMainWindow):
         self._start_provision_polling()
         self._stop_cti()
         self._start_cti()
-        self._info("Salvo", "Configurações de provisionamento, atualização e CTI salvas.", self.prov_win)
+        self._info("Salvo", "Configurações de provisionamento e CTI salvas.", self.prov_win)
 
     def _stop_provision_polling(self):
         if self._prov_timer is not None:

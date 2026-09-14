@@ -161,11 +161,16 @@ DEFAULT_UPDATER_URL = "https://raw.githubusercontent.com/edes-neves/softphone/ma
 
 
 def _clean_updater(raw):
-    """Normaliza a seção de atualização automática da configuração."""
+    """Normaliza a seção de atualização automática da configuração.
+
+    A checagem de atualização é um recurso do menu Configurações → Atualização e
+    fica habilitada por padrão: mesmo instalações que salvaram ``enabled: false``
+    na UI antiga voltam a verificar (a checagem inicial não depende mais dela).
+    """
     if not isinstance(raw, dict):
         raw = {}
     return {
-        "enabled": _as_bool(raw.get("enabled")),
+        "enabled": _as_bool(raw.get("enabled", True)),
         "url": str(raw.get("url") or DEFAULT_UPDATER_URL).strip(),
         "auth_user": str(raw.get("auth_user") or "").strip(),
         "check_on_start": _as_bool(raw.get("check_on_start", True)),
@@ -186,6 +191,41 @@ def _clean_cti(raw):
         "enabled": _as_bool(raw.get("enabled")),
         "port": port,
         "token": str(raw.get("token") or "").strip(),
+    }
+
+
+def _clean_keepalive(raw):
+    """Normaliza a seção de Keep-Alive UDP (NAT/firewall) da configuração."""
+    if not isinstance(raw, dict):
+        raw = {}
+    try:
+        interval = int(raw.get("interval_sec", 15))
+    except (TypeError, ValueError):
+        interval = 15
+    return {
+        "enabled": _as_bool(raw.get("enabled", True)),
+        "interval_sec": max(1, min(3600, interval)),
+    }
+
+
+def _clean_dtmf(raw):
+    """Normaliza a seção de DTMF (método e duração do tom) da configuração.
+
+    ``method`` pode ser ``"rfc2833"`` (pacote de áudio RTP) ou ``"sipinfo"``
+    (sinalização SIP INFO). ``duration_ms`` é a duração do tom (padrão 160 ms).
+    """
+    if not isinstance(raw, dict):
+        raw = {}
+    method = str(raw.get("method") or "rfc2833")
+    if method not in ("rfc2833", "sipinfo"):
+        method = "rfc2833"
+    try:
+        duration = int(raw.get("duration_ms", 160))
+    except (TypeError, ValueError):
+        duration = 160
+    return {
+        "method": method,
+        "duration_ms": max(80, min(1000, duration)),
     }
 
 
@@ -210,6 +250,8 @@ def _default_config(secrets):
         "provisioning": _clean_provisioning(None),
         "updater": _clean_updater(None),
         "cti": _clean_cti(None),
+        "keepalive": _clean_keepalive(None),
+        "dtmf": _clean_dtmf(None),
     }
 
 
@@ -279,6 +321,8 @@ def load_config(secrets):
             "provisioning": _clean_provisioning(data.get("provisioning")),
             "updater": _clean_updater(data.get("updater")),
             "cti": _clean_cti(data.get("cti")),
+            "keepalive": _clean_keepalive(data.get("keepalive")),
+            "dtmf": _clean_dtmf(data.get("dtmf")),
         }
     except Exception as e:
         logging.error("Erro ao ler config (%s); usando configuração vazia", e)

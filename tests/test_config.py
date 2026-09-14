@@ -200,10 +200,70 @@ def test_default_config_has_cti():
     assert cfg["cti"]["enabled"] is False
 
 
+def test_clean_keepalive_defaults():
+    ka = config._clean_keepalive(None)
+    assert ka["enabled"] is True
+    assert ka["interval_sec"] == 15
+    assert config._clean_keepalive("lixo") == {"enabled": True, "interval_sec": 15}
+
+
+def test_clean_keepalive_values():
+    ka = config._clean_keepalive({"enabled": "false", "interval_sec": "60"})
+    assert ka["enabled"] is False
+    assert ka["interval_sec"] == 60
+
+
+def test_clean_keepalive_clamped():
+    assert config._clean_keepalive({"interval_sec": 0})["interval_sec"] == 1
+    assert config._clean_keepalive({"interval_sec": 999999})["interval_sec"] == 3600
+    assert config._clean_keepalive({"interval_sec": "abc"})["interval_sec"] == 15
+
+
+def test_clean_dtmf_defaults():
+    d = config._clean_dtmf(None)
+    assert d["method"] == "rfc2833"
+    assert d["duration_ms"] == 160
+
+
+def test_clean_dtmf_values():
+    d = config._clean_dtmf({"method": "sipinfo", "duration_ms": "200"})
+    assert d["method"] == "sipinfo"
+    assert d["duration_ms"] == 200
+    assert config._clean_dtmf({"method": "lixo"})["method"] == "rfc2833"
+
+
+def test_clean_dtmf_clamped():
+    assert config._clean_dtmf({"duration_ms": 5})["duration_ms"] == 80
+    assert config._clean_dtmf({"duration_ms": 99999})["duration_ms"] == 1000
+    assert config._clean_dtmf({"duration_ms": "abc"})["duration_ms"] == 160
+
+
+def test_default_config_has_keepalive_and_dtmf():
+    cfg = config._default_config(FakeSecrets())
+    assert cfg["keepalive"]["enabled"] is True
+    assert cfg["keepalive"]["interval_sec"] == 15
+    assert cfg["dtmf"]["method"] == "rfc2833"
+
+
+def test_load_config_keepalive_dtmf_roundtrip(tmp_path, monkeypatch):
+    monkeypatch.setattr(config, "CONFIG_DIR", str(tmp_path), raising=False)
+    monkeypatch.setattr(config, "CONFIG_FILE", str(tmp_path / "config.json"), raising=False)
+    sec = FakeSecrets()
+    cfg = config._default_config(sec)
+    cfg["keepalive"] = {"enabled": False, "interval_sec": 45}
+    cfg["dtmf"] = {"method": "sipinfo", "duration_ms": 250}
+    config.save_config(cfg)
+    loaded = config.load_config(sec)
+    assert loaded["keepalive"] == {"enabled": False, "interval_sec": 45}
+    assert loaded["dtmf"] == {"method": "sipinfo", "duration_ms": 250}
+
+
 def test_clean_updater_default_url():
     up = config._clean_updater(None)
-    assert up["enabled"] is False
+    assert up["enabled"] is True
     assert up["url"] == config.DEFAULT_UPDATER_URL
     assert up["check_on_start"] is True
+    # false explícito é preservado
+    assert config._clean_updater({"enabled": False})["enabled"] is False
     # url explícita não é sobrescrita
     assert config._clean_updater({"url": "https://servidor/x.json"})["url"] == "https://servidor/x.json"

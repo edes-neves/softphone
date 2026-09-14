@@ -1,8 +1,8 @@
 """Atualização automática: checa versão remota e baixa o novo binário.
 
-Camada pura/testável para a lógica de versionamento e download; a aplicação do
-binário é feita de forma conservadora (baixar para /tmp, validar checksum e
-informar o usuário para reiniciar), evitando corromper o binário em execução.
+Camada pura/testável para a lógica de versionamento e download; o instalador é
+baixado para a pasta Downloads do usuário (validado por checksum) e o usuário
+o substitui manualmente, evitando corromper o binário em execução.
 
 Formato do version.json servido (idealmente junto do provisioning):
 
@@ -27,6 +27,7 @@ __all__ = [
     "parse_version_info",
     "fetch_version_info",
     "is_newer",
+    "downloads_dir",
     "download_to_temp",
     "sha256_file",
     "Updater",
@@ -102,11 +103,29 @@ def sha256_file(path, chunk=1 << 20):
     return h.hexdigest()
 
 
-def download_to_temp(url, dest_dir=None, timeout=60, auth_user="", auth_pass=""):
-    """Baixa o artefato para um diretório temporário e retorna o caminho."""
-    import tempfile
+def downloads_dir():
+    """Pasta de Downloads do usuário (destino padrão do instalador).
 
-    dest_dir = dest_dir or tempfile.gettempdir()
+    Respeita `XDG_DOWNLOAD_DIR` quando configurado; senão usa ~/Downloads.
+    """
+    env = os.environ.get("XDG_DOWNLOAD_DIR")
+    if env and os.path.isabs(env):
+        return os.path.expanduser(env)
+    return os.path.join(os.path.expanduser("~"), "Downloads")
+
+
+def download_to_temp(url, dest_dir=None, timeout=60, auth_user="", auth_pass=""):
+    """Baixa o artefato e retorna o caminho final do arquivo.
+
+    Por padrão o arquivo vai para a pasta Downloads do usuário (`downloads_dir`).
+    Durante o download é usado um sufixo ``.partial`` para nunca deixar um
+    arquivo incompleto com o nome final; no fim ele é renomeado.
+    """
+    dest_dir = dest_dir or downloads_dir()
+    try:
+        os.makedirs(dest_dir, exist_ok=True)
+    except OSError:
+        pass
     req = urllib.request.Request(url)
     if auth_user:
         import base64
