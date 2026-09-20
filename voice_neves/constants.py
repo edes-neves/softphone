@@ -18,7 +18,7 @@ __all__ = [
 APP_NAME = "Voice Neves"
 APP_VERSION = _pkg_version
 APP_DEV = "José Edes Neves"
-APP_UPDATED = "08/2026"
+APP_UPDATED = "09/2026"
 CONTACT_EMAIL = "nevestecnologias@gmail.com"
 MIT_LICENSE = (
     "MIT License\n\n"
