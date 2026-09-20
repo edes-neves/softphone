@@ -4,6 +4,27 @@ Este modulo concentra a UI (Qt) e o estado do SoftphoneApp. Toda a logica
 pura (config, historico, contatos, secrets, ldap, modelos pjsip,
 provisioning, updater, cti) vive em modulos separados do pacote voice_neves.
 """
+# =========================================================================
+# ARQUITETURA DE ÁUDIO (Linux moderno: PulseAudio / PipeWire)
+# -------------------------------------------------------------------------
+# O PJSIP/pjmedia só fala nativamente com ALSA, OSS e PortAudio — NÃO existe
+# backend nativo de PulseAudio nem de PipeWire no pjsua2. Todo acesso a
+# PulseAudio/PipeWire acontece via "ALSA bridge" (pipewire-alsa,
+# pulseaudio-alsa, ou os plugins equivalentes da distro). Este app NÃO tem
+# backend PA/PW nativo e NÃO pretende ter: isso exigiria trocar o backend
+# SIP inteiro (pjsua2 -> Linphone SDK / GStreamer), fora do escopo.
+#
+# Estratégia adotada aqui para tornar o ALSA bridge confiável:
+#   - Configurar AEC (cancelamento de eco), AGC e VAD quando o build expuser
+#     os campos (sempre com try/except, porque builds do pjsua2 variam).
+#   - Revalidar os dispositivos de áudio ANTES de cada chamada (hotplug):
+#     o PJSIP não tem hotplug nativo e o enumDev2() só reflete USB/Bluetooth
+#     quando o gerenciador reabre; nunca trocamos de device com chamada ativa.
+#   - Diagnosticar falhas com clareza (dicas de bridge PipeWire/PulseAudio,
+#     saída de `aplay -L`) sem alterar a escolha automática de dispositivos.
+#   - Degradar com elegância: sem dispositivo, chamadas seguem mudas e o app
+#     permanece utilizável (setNullDev + aviso ao usuário).
+# =========================================================================
 import os
 import csv
 import json
@@ -60,7 +81,7 @@ from .runtime import secrets
 from .utils import (
     resource_path, notify_send, is_wayland, appindicator_available,
     clean_extension, is_valid_extension, is_valid_server,
-    build_sip_target, format_phone, phone_matches, _as_bool,
+    build_sip_target, format_phone, phone_matches, _as_bool, failover_target,
 )
 from .config import _account_key, _clean_ldap, _clean_keepalive, _clean_dtmf, load_config, save_config, DEFAULT_UPDATER_URL
 from .history import load_history, save_history
@@ -96,6 +117,25 @@ AUDIODEV_ERRNO_START = 420001
 AUDIODEV_ERRNO_END = 421000
 
 
+# Mínimo de pacotes RX da chamada para considerar a amostra de QoS confiável.
+# Abaixo disso o RTCP ainda não tem histórico e pkt == 0 reportaria perda falsa.
+MIN_PKT_FOR_QOS = 10
+
+
+def _volume_curve(slider_value):
+    """Mapeia 0-10 (slider) para 0.0-2.0 (multiplicador linear do PJSIP) usando
+    uma curva perceptual (aproximação de potência). O ouvido humano percebe
+    volume de forma aproximadamente logarítmica; o slider precisa compensar
+    isso para que cada passo soe mais uniforme."""
+    try:
+        v = max(0.0, min(10.0, float(slider_value)))
+    except (TypeError, ValueError):
+        v = 5.0
+    if v == 0:
+        return 0.0
+    return 2.0 * ((v / 10.0) ** 1.6)
+
+
 def is_audio_device_error(e):
     """True se o erro do pjsua2 for falha ao abrir/usar dispositivo de som."""
     if not isinstance(e, pj.Error):
@@ -120,7 +160,19 @@ def audio_error_hint(err_text=""):
         "  2. Teste fora do app: arecord -D default -f cd /dev/null e "
         "aplay -D default /dev/null\n"
         "  3. Em Configurações > Áudio, escolha outro dispositivo de "
-        "captura/reprodução."
+        "captura/reprodução.\n\n"
+        "--- PipeWire / PulseAudio (Linux moderno) ---\n"
+        "O PJSIP acessa PulseAudio e PipeWire através do ALSA bridge\n"
+        "(pipewire-alsa / pulseaudio-alsa). Se as chamadas conectam\n"
+        "sem som, verifique:\n"
+        "  • Fedora: sudo dnf install pipewire-pulseaudio pipewire-alsa\n"
+        "  • Arch/BigLinux: sudo pacman -S pipewire-pulse pipewire-alsa\n"
+        "  • Debian/Ubuntu: sudo apt install pipewire-audio pipewire-alsa\n"
+        "  • Confirme o servidor: pactl info | grep 'Server Name'\n"
+        "    (deve dizer 'PulseAudio (on PipeWire ...)')\n"
+        "  • Confirme o bridge: aplay -L | grep -E 'pipewire|default'\n"
+        "    (se vazio, o pipewire-alsa não está configurado)\n"
+        "  • Teste fora do app: speaker-test -c 2 -t sine -l 1"
     )
 
 
@@ -918,6 +970,7 @@ class SoftphoneApp(QMainWindow):
         self._answer_blink_timer = None
         self._blink_color_primary = True
         self.settings_win = None
+        self._devs_timer = None
         self.codec_win = None
         self.edit_win = None
         self._edit_entry = None
@@ -969,6 +1022,7 @@ class SoftphoneApp(QMainWindow):
         self._prov_timer = None
         self._prov_thread = None
         self._update_thread = None
+        self._update_download_thread = None
         self._last_prov_sync = 0.0
         self._update_checked = False
         self._cti = None
@@ -1202,6 +1256,17 @@ class SoftphoneApp(QMainWindow):
             act.triggered.connect(
                 lambda _=False, k=key: self._edit_account_from_menu(k)
             )
+            act_del = menu.addAction(f"🗑  Deletar {key}")
+            act_del.triggered.connect(
+                lambda _=False, k=key: self._delete_account_from_menu(k)
+            )
+
+    def _delete_account_from_menu(self, key):
+        entry = self._entry_by_key(key)
+        if entry is None:
+            self._error("Erro", "Conta não encontrada.")
+            return
+        self.delete_account(entry)
 
     def _edit_account_from_menu(self, key):
         entry = self._entry_by_key(key)
@@ -1488,6 +1553,50 @@ class SoftphoneApp(QMainWindow):
             except Exception as e:
                 logging.warning("Não foi possível aplicar STUN (%s): %s", stun, e)
 
+        # Configuração de áudio do endpoint (AEC/VAD). Aplica-se antes do
+        # libInit; cada acesso é protegido porque builds do pjsua2 variam
+        # (alguns nomeiam o MediaConfig como "mediaConfig", outros "medConfig").
+        audio_cfg = self.config_data.get("audio") or {}
+        try:
+            ep_media = getattr(ep_cfg, "mediaConfig", None)
+            if ep_media is None:
+                ep_media = getattr(ep_cfg, "medConfig", None)
+        except Exception:
+            ep_media = None
+        if ep_media is not None:
+            try:
+                try:
+                    aec_tail = max(0, min(500, int(audio_cfg.get("aec_tail_ms", 200))))
+                except (TypeError, ValueError):
+                    aec_tail = 200
+                if _as_bool(audio_cfg.get("aec_enabled", True)):
+                    # Cancelamento de eco com o algoritmo de software do build
+                    # (PJMEDIA_ECHO_USE_SW_ECHO). Em viva-voz, sem AEC o
+                    # interlocutor ouve o próprio eco.
+                    sw_echo = getattr(pj, "PJMEDIA_ECHO_USE_SW_ECHO", None)
+                    if sw_echo is not None:
+                        ep_media.ecOptions = sw_echo
+                    ep_media.ecTailLen = aec_tail
+                else:
+                    # ecTailLen == 0 desliga o cancelador de eco no PJSIP.
+                    ep_media.ecOptions = 0
+                    ep_media.ecTailLen = 0
+                    logging.info("Cancelamento de eco desativado pelo usuário (audio.aec_enabled=false)")
+            except Exception as e:
+                logging.warning("Não foi possível configurar cancelamento de eco (AEC): %s", e)
+
+            try:
+                # VAD (detecção de voz): noVad=False liga o VAD do PJSIP (padrão).
+                # Nível de endpoint porque o AccountMediaConfig deste build não
+                # expõe noVad/AGC por conta (ver _apply_media_config).
+                no_vad = getattr(ep_media, "noVad", None)
+                if no_vad is not None:
+                    ep_media.noVad = not _as_bool(audio_cfg.get("vad", True))
+            except Exception as e:
+                logging.warning("Não foi possível configurar VAD do endpoint: %s", e)
+        else:
+            logging.warning("EpConfig sem MediaConfig exposto; AEC/VAD do endpoint não configurados")
+
         self.endpoint.libInit(ep_cfg)
 
         self._udp_tid = None
@@ -1503,6 +1612,14 @@ class SoftphoneApp(QMainWindow):
             self._create_tls_transport()
 
         self.endpoint.libStart()
+        try:
+            logging.info(
+                "Configuração de áudio do endpoint: ecOptions=0x%x ecTailLen=%dms noVad=%s",
+                ep_media.ecOptions, ep_media.ecTailLen,
+                ep_media.noVad,
+            )
+        except Exception as e:
+            logging.debug("Não foi possível reportar a configuração de áudio: %s", e)
         self._detect_video_support()
         self._detect_audio_support()
 
@@ -1515,6 +1632,51 @@ class SoftphoneApp(QMainWindow):
             return None
         except Exception as e:
             return pj_error_text(e)
+
+    def _validate_audio_devices(self):
+        # Revalidação barata antes de cada chamada: o PJSIP não tem hotplug
+        # nativo, então o enumDev2() só reflete USB/Bluetooth novos quando o
+        # gerenciador reabre. Se o dispositivo ativo sumiu, cai para o padrão
+        # do sistema. Nunca levanta exceção e nunca troca de device com
+        # chamada ativa (isso corrompe o estado do pjsua).
+        if self.endpoint is None or not self._has_audio:
+            return
+        if self.call_state in ("IN_CALL", "HOLD"):
+            return
+        try:
+            adm = self.endpoint.audDevManager()
+            devs = list(adm.enumDev2())
+            self._cached_ins = [
+                f"{i} | {d.name}" for i, d in enumerate(devs)
+                if getattr(d, "inputCount", 0)
+            ]
+            self._cached_outs = [
+                f"{i} | {d.name}" for i, d in enumerate(devs)
+                if getattr(d, "outputCount", 0)
+            ]
+            if not devs:
+                return
+            try:
+                cur_in = int(adm.getCaptureDev())
+                cur_out = int(adm.getPlaybackDev())
+            except Exception:
+                return
+
+            def dev_valid(idx):
+                # índices negativos são os "padrão do sistema" (-1/-2)
+                return idx < 0 or idx < len(devs)
+
+            if not dev_valid(cur_in) or not dev_valid(cur_out):
+                logging.warning(
+                    "Dispositivo de áudio ativo sumiu (captura=%s saída=%s); "
+                    "voltando para o padrão do sistema",
+                    cur_in, cur_out,
+                )
+                err = self._try_open_sound(-1, -2)
+                if err is not None:
+                    logging.warning("Falha ao reabrir dispositivo padrão: %s", err)
+        except Exception as e:
+            logging.warning("Falha ao revalidar dispositivos de áudio: %s", e)
 
     def _detect_audio_support(self):
         self._has_audio = False
@@ -1564,6 +1726,23 @@ class SoftphoneApp(QMainWindow):
                     cap_id, play_id,
                 )
                 return
+
+        # Diagnóstico ALSA (só log, não muda o comportamento): mostra quais
+        # devices o sistema vê (incluindo o pipewire-alsa/pulseaudio-alsa),
+        # para distinguir problema do PJSIP de problema da configuração ALSA.
+        try:
+            proc = subprocess.run(
+                ["aplay", "-L"],
+                capture_output=True, text=True, timeout=2,
+            )
+            out = (proc.stdout or "").strip()
+            sample = [ln for ln in out.splitlines() if ln.strip()][:12]
+            if sample:
+                logging.info("Diagnóstico ALSA (aplay -L): %s", " | ".join(sample))
+            else:
+                logging.info("Diagnóstico ALSA (aplay -L): sem saída (bridge ALSA ausente?)")
+        except Exception as e:
+            logging.debug("Diagnóstico ALSA indisponível: %s", e)
 
         try:
             self.endpoint.audDevManager().setNullDev()
@@ -1848,9 +2027,11 @@ class SoftphoneApp(QMainWindow):
         form.addRow(fwd)
 
         btn_save = RoundedButton(dlg, "💾  Salvar alterações", self.save_edit_account, COLOR_SUCCESS, "#FFFFFF", pady=6)
+        btn_delete = RoundedButton(dlg, "🗑  Deletar", self._delete_account_from_edit, COLOR_DANGER, "#FFFFFF", pady=6)
         btn_close = RoundedButton(dlg, "Fechar", dlg.close, COLOR_PRIMARY, "#FFFFFF", pady=6)
         btn_row = QHBoxLayout()
         btn_row.addWidget(btn_save)
+        btn_row.addWidget(btn_delete)
         btn_row.addWidget(btn_close)
         form.addRow(btn_row)
         dlg.finished.connect(lambda *_: (self.edit_win is not None and setattr(self, "edit_win", None),
@@ -1924,7 +2105,7 @@ class SoftphoneApp(QMainWindow):
         acc_old = entry.get("acc")
         if acc_old is not None:
             try:
-                acc_old.delete()
+                acc_old.shutdown()
             except Exception as e:
                 logging.warning("Erro ao remover conta antiga do pjsip: %s", e)
         if entry in self.accounts:
@@ -1947,21 +2128,39 @@ class SoftphoneApp(QMainWindow):
             self._info("Nenhuma seleção", "Selecione uma conta na lista.")
             return
         user, server = entry["data"]["user"], entry["data"]["server"]
+        ident = f"{user}@{server}"
+        if not self._ask_yes(
+            "Deletar conta",
+            f"Deseja realmente deletar a conta {ident}?\n\n"
+            "A conta será removida do app e do cofre de senhas.",
+        ):
+            return
         acc = entry.get("acc")
         if acc is not None:
             try:
-                acc.delete()
+                acc.shutdown()
             except Exception as e:
                 logging.warning("Erro ao remover conta do pjsip: %s", e)
         if entry in self.accounts:
             self.accounts.remove(entry)
         self.config_data["accounts"] = [a for a in self.config_data["accounts"]
                                         if not (a["user"] == user and a["server"] == server)]
-        secrets.delete(f"{user}@{server}")
+        secrets.delete(ident)
         save_config(self.config_data)
         self._reload_accounts_combo()
-        self.refresh()
-        self.update_presence()
+        # Re-registra o que sobrou (garantindo nova conta padrão); se não
+        # sobrou nenhuma, o auto_register_accounts apenas limpa a lista.
+        self.auto_register_accounts()
+
+    def _delete_account_from_edit(self):
+        entry = self._edit_entry if self._edit_entry is not None else self.selected_account()
+        if entry is None:
+            return
+        self.delete_account(entry)
+        if self.edit_win is not None:
+            self.edit_win.close()
+            self.edit_win = None
+        self._edit_entry = None
 
     def refresh(self):
         """Campo 'Contas SIP': mostra as contas, ou durante/in para chamadas o
@@ -2146,7 +2345,7 @@ class SoftphoneApp(QMainWindow):
             return
         for entry in self.accounts:
             try:
-                entry["acc"].delete()
+                entry["acc"].shutdown()
             except Exception:
                 pass
         self.accounts = []
@@ -2160,6 +2359,9 @@ class SoftphoneApp(QMainWindow):
         self._publish_presence()
 
     FAILOVER_COOLDOWN = 30
+    # Teto do backoff exponencial (30s, 60s, 120s, ... até 10 min): evita
+    # enxurrada de re-registros quando ambos os servidores recusam a senha.
+    FAILOVER_MAX_COOLDOWN = 600
 
     def register_account(self, data, current_server=None):
         user = data["user"]
@@ -2173,6 +2375,7 @@ class SoftphoneApp(QMainWindow):
         self._apply_security_config(acfg)
         self._apply_nat_config(acfg)
         self._apply_video_config(acfg)
+        self._apply_media_config(acfg)
 
         try:
             acfg.mwiConfig.enabled = True
@@ -2191,6 +2394,7 @@ class SoftphoneApp(QMainWindow):
         entry = {
             "acc": acc, "data": dict(data), "server_used": active,
             "status": "REGISTERING", "buddies": [], "_failover_at": 0.0,
+            "_failover_attempts": 0,
         }
         self.accounts.append(entry)
         self._create_presence_buddies(entry)
@@ -2208,25 +2412,32 @@ class SoftphoneApp(QMainWindow):
             self._maybe_failover(entry)
 
     def _maybe_failover(self, entry):
-        backup = (entry.get("data") or {}).get("backup_server") or ""
-        if not backup:
-            return
         now = time.time()
-        if now - entry.get("_failover_at", 0) < self.FAILOVER_COOLDOWN:
+        data = entry.get("data") or {}
+        # Backoff exponencial: cada falha consecutiva dobra o cooldown
+        # (30s, 60s, 120s, ...), com teto em FAILOVER_MAX_COOLDOWN.
+        attempts = int(entry.get("_failover_attempts") or 0) + 1
+        cooldown = min(
+            self.FAILOVER_COOLDOWN * (2 ** (attempts - 1)),
+            self.FAILOVER_MAX_COOLDOWN,
+        )
+        target = failover_target(
+            entry.get("server_used"),
+            data.get("server"),
+            data.get("backup_server"),
+            entry.get("_failover_at"),
+            cooldown,
+            now,
+        )
+        if not target:
             return
         entry["_failover_at"] = now
-        current = entry.get("server_used") or entry["data"].get("server") or ""
-        target = backup if current == (entry["data"].get("server") or "") else (
-            entry["data"].get("server") or "")
-        server_label = entry["data"].get("server") or ""
-        if target and target != current:
-            logging.warning("Failover de %s: registrando em %s (estava em %s)",
-                            server_label, target, current)
-            self._recreate_account(entry, target)
-            self.show_toast(f"Servidor indisponível; tentando backup {target}")
-        elif current == target:
-            logging.info("Failover de %s: backup também indisponível (%s)",
-                         entry["data"].get("server"), target)
+        entry["_failover_attempts"] = attempts
+        current = entry.get("server_used") or data.get("server") or ""
+        logging.warning("Failover de %s: registrando em %s (estava em %s)",
+                        data.get("server") or "", target, current)
+        self._recreate_account(entry, target)
+        self.show_toast(f"Servidor indisponível; tentando backup {target}")
 
     def _recreate_account(self, entry, target):
         try:
@@ -2235,15 +2446,18 @@ class SoftphoneApp(QMainWindow):
             idx = -1
         self.accounts.remove(entry)
         try:
-            entry["acc"].delete()
+            entry["acc"].shutdown()
         except Exception as e:
             logging.warning("Erro ao remover conta no failover: %s", e)
-        for buddy in entry.get("buddies", []):
-            try:
-                buddy.delete()
-            except Exception:
-                pass
-        self.register_account(entry["data"], current_server=target)
+        self._drop_presence_buddies(entry)
+        new_entry = self.register_account(entry["data"], current_server=target)
+        # Preserva o cooldown do failover na conta recriada: sem isso, cada
+        # falha de autenticação com backup configurado recriava a conta em
+        # loop infinito (nova entry sempre nascia com _failover_at = 0.0).
+        new_entry["_failover_at"] = time.time()
+        # backoff é preservado na recriação: cada falha consecutiva dobra o
+        # cooldown mesmo depois de trocar de servidor.
+        new_entry["_failover_attempts"] = int(entry.get("_failover_attempts") or 0)
         if idx >= 0 and len(self.accounts) > 1:
             moved = self.accounts.pop()
             self.accounts.insert(min(idx, len(self.accounts)), moved)
@@ -2283,6 +2497,19 @@ class SoftphoneApp(QMainWindow):
                 logging.info("Presença monitorada: %s", uri)
             except Exception as e:
                 logging.warning("Não foi possível monitorar presença de %s: %s", uri, e)
+
+    def _drop_presence_buddies(self, entry):
+        # O binding pjsua2 (SWIG) desta versão NÃO expõe Buddy.delete()/
+        # shutdown(): o antigo buddy.delete() aqui falhava silenciosamente
+        # (AttributeError engolido) e nenhuma assinatura era removida. A
+        # remoção real ocorre no destrutor C++ (~Buddy -> pjsua_buddy_del),
+        # que o CPython executa quando o wrapper perde a última referência;
+        # então abandonamos as referências explicitamente (determinístico,
+        # sem depender do ciclo de coleta de objetos).
+        try:
+            entry["buddies"] = []
+        except Exception as e:
+            logging.warning("Falha ao remover buddies de presença: %s", e)
 
     def _update_presence_ui(self):
         if self.contacts_win is not None:
@@ -2400,19 +2627,22 @@ class SoftphoneApp(QMainWindow):
         try:
             vcfg = acfg.videoConfig
             usable = getattr(self, "_video_workaround_dev", -1)
+            has_video = bool(getattr(self, "_has_video", False))
+            # RECEBER vídeo não exige câmera local: habilita a exibição
+            # automática sempre que o app tem suporte a vídeo, mesmo sem
+            # dispositivo de captura utilizável.
+            vcfg.autoShowIncoming = has_video
             if usable >= 0:
-                vcfg.autoShowIncoming = True
                 vcfg.autoTransmitOutgoing = True
                 vcfg.defaultCaptureDevice = usable
             else:
-                # Sem câmera que abra de verdade: NÃO ativar vídeo automático.
+                # Sem câmera que abra de verdade: NÃO enviar vídeo automático.
                 # Com autoTransmitOutgoing ligado, uma chamada de entrada cujo
                 # SDP ofereça vídeo faz o PJSIP abrir a câmera durante a
                 # inicialização da mídia; se a abertura falhar (BigLinux:
                 # V4L2/PipeWire sem permissão, device id salvo inválido etc.),
                 # o INVITE é rejeitado com 4xx/5xx ANTES do callback do app —
                 # quem liga ouve "ocupado" e o softphone nunca toca.
-                vcfg.autoShowIncoming = False
                 vcfg.autoTransmitOutgoing = False
                 try:
                     vcfg.defaultCaptureDevice = -1
@@ -2421,6 +2651,35 @@ class SoftphoneApp(QMainWindow):
         except Exception as e:
             logging.warning("Não foi possível aplicar configuração de vídeo: %s", e)
 
+    def _apply_media_config(self, acfg):
+        # AGC/VAD por conta. O AccountMediaConfig de certos builds do pjsua2
+        # NÃO expõe enableCaptureAgc/enablePlaybackAgc/noVad; quando faltam,
+        # logamos em debug e seguimos com o padrão do PJSIP (degradação suave).
+        audio = (self.config_data or {}).get("audio") or {}
+        try:
+            mc = acfg.mediaConfig
+        except Exception as e:
+            logging.warning("Não foi possível acessar a mídia da conta: %s", e)
+            return
+        try:
+            enable_capture_agc = getattr(mc, "enableCaptureAgc", None)
+            if enable_capture_agc is not None:
+                mc.enableCaptureAgc = _as_bool(audio.get("agc_capture", True))
+        except Exception as e:
+            logging.debug("AGC de captura não exposto nesta build do pjsua2: %s", e)
+        try:
+            enable_playback_agc = getattr(mc, "enablePlaybackAgc", None)
+            if enable_playback_agc is not None:
+                mc.enablePlaybackAgc = _as_bool(audio.get("agc_playback", False))
+        except Exception as e:
+            logging.debug("AGC de reprodução não exposto nesta build do pjsua2: %s", e)
+        try:
+            no_vad = getattr(mc, "noVad", None)
+            if no_vad is not None:
+                mc.noVad = not _as_bool(audio.get("vad", True))
+        except Exception as e:
+            logging.debug("noVad não exposto nesta build do pjsua2: %s", e)
+
     def update_account_status(self, acc, status):
         changed = None
         for entry in self.accounts:
@@ -2428,6 +2687,11 @@ class SoftphoneApp(QMainWindow):
                 if entry["status"] != status and status in ("ONLINE", "OFFLINE"):
                     changed = (entry["data"], status)
                 entry["status"] = status
+                if status == "ONLINE":
+                    # contador/cooldown zeram quando a conta volta a ficar
+                    # online: backoff só existe durante falhas consecutivas.
+                    entry["_failover_at"] = 0.0
+                    entry["_failover_attempts"] = 0
                 break
         self.refresh()
         self.update_presence()
@@ -2593,9 +2857,13 @@ class SoftphoneApp(QMainWindow):
             "background: %s; color: #FFFFFF; border-radius: 12px; border: none; "
             "padding: %s; font-weight: 600;" % (highlight, btn._padding)
         )
-        self._key_anim_timer = QTimer(self)
-        self._key_anim_timer.setSingleShot(True)
-        self._key_anim_timer.timeout.connect(self._restore_key_style)
+        # Reutiliza um único QTimer criado sob demanda: criar um novo a cada
+        # tecla (mesmo parando o anterior) descartava e recriava objetos sem
+        # necessidade. Visual idêntico (140 ms).
+        if self._key_anim_timer is None:
+            self._key_anim_timer = QTimer(self)
+            self._key_anim_timer.setSingleShot(True)
+            self._key_anim_timer.timeout.connect(self._restore_key_style)
         self._key_anim_timer.start(140)
 
     def _restore_key_style(self):
@@ -2605,12 +2873,13 @@ class SoftphoneApp(QMainWindow):
             except Exception:
                 pass
             self._key_flash_btn = None
+        # Não anula self._key_anim_timer aqui: o timer único é reutilizado por
+        # _flash_key (a criação sob demanda só deve ocorrer na primeira vez).
         if self._key_anim_timer is not None:
             try:
                 self._key_anim_timer.stop()
             except Exception:
                 pass
-            self._key_anim_timer = None
 
     def _play_key_tone(self, digit):
         """Toca o tom DTMF da tecla no alto-falante (feedback sonoro)."""
@@ -2771,6 +3040,10 @@ class SoftphoneApp(QMainWindow):
         dest = f"sip:{number}@{entry['data']['server']}"
         logging.info("Ligando para %s usando a conta %s", dest, entry["data"]["user"])
         try:
+            self._validate_audio_devices()
+        except Exception as e:
+            logging.debug("Falha ao revalidar dispositivos de áudio: %s", e)
+        try:
             if self.current_call is not None and self.current_call is not self.incoming_call:
                 self._disconnect_call_media()
                 if self._call_is_confirmed(self.current_call):
@@ -2900,6 +3173,10 @@ class SoftphoneApp(QMainWindow):
         if self.current_call is None:
             return
         try:
+            try:
+                self._validate_audio_devices()
+            except Exception as e:
+                logging.debug("Falha ao revalidar dispositivos de áudio: %s", e)
             try:
                 call_id = self.current_call.getId()
                 timer_id = self._forward_timers.pop(call_id, None)
@@ -3609,8 +3886,13 @@ class SoftphoneApp(QMainWindow):
         except Exception as e:
             logging.warning("Sessão de chamada já encerrada no media state: %s", e)
             return
+        # Vídeo negociado/ativo (independente de conseguir anexar a janela):
+        # ter uma stream de vídeo ativa não depende da câmera local.
+        has_video = any(
+            mi.type == pj.PJMEDIA_TYPE_VIDEO and mi.status == pj.PJSUA_CALL_MEDIA_ACTIVE
+            for mi in ci.media
+        )
         try:
-            has_video = False
             for mi in ci.media:
                 if mi.type == pj.PJMEDIA_TYPE_AUDIO and mi.status == pj.PJSUA_CALL_MEDIA_ACTIVE:
                     med = call.getMedia(mi.index)
@@ -3623,8 +3905,7 @@ class SoftphoneApp(QMainWindow):
                     self.current_audio_media = audio
                     self.apply_volumes()
                 elif mi.type == pj.PJMEDIA_TYPE_VIDEO and mi.status == pj.PJSUA_CALL_MEDIA_ACTIVE:
-                    if self._attach_remote_video(mi):
-                        has_video = True
+                    self._attach_remote_video(mi)
             if has_video:
                 self._show_video_area(True)
             else:
@@ -3643,15 +3924,25 @@ class SoftphoneApp(QMainWindow):
             return
         try:
             info = call.getInfo()
+            found_active_video = False
             for media in info.media:
                 if media.type == pj.PJMEDIA_TYPE_VIDEO and media.status == pj.PJSUA_CALL_MEDIA_ACTIVE:
-                    stream = call.getStreamInfo(media.index)
-                    codec = getattr(stream, "codecName", "vídeo") or "vídeo"
+                    found_active_video = True
+                    try:
+                        stream = call.getStreamInfo(media.index)
+                        codec = getattr(stream, "codecName", "vídeo") or "vídeo"
+                    except Exception:
+                        # Vídeo ativo de verdade, mas stats do stream indisponíveis
+                        # neste build: não reportar "aguardando mídia".
+                        label.setText("Codec: vídeo • Estatísticas indisponíveis neste build")
+                        return
                     label.setText(f"Codec: {codec}  •  Resolução: automática  •  FPS: automático")
                     return
+            if not found_active_video:
+                label.setText("Vídeo aguardando mídia")
         except Exception as e:
             logging.debug("Informações de vídeo indisponíveis: %s", e)
-        label.setText("Vídeo aguardando mídia")
+            label.setText("Vídeo aguardando mídia")
 
     def _attach_remote_video(self, mi):
         try:
@@ -3804,6 +4095,11 @@ class SoftphoneApp(QMainWindow):
                 pkt = self._qos_number(rtcp.rxStat.pkt)
                 lost = self._qos_number(rtcp.rxStat.loss)
                 total = pkt + lost
+                # Chamadas curtas (< MIN_PKT_FOR_QOS pacotes recebidos) ainda
+                # não têm amostra confiável: pkt == 0 reportaria "perda 100%"
+                # falsa logo no início da chamada.
+                if pkt < MIN_PKT_FOR_QOS:
+                    return None
                 loss_pct = round(lost * 100.0 / total, 1) if total > 0 else 0.0
                 return rtt_ms, jitter_ms, loss_pct
         return None
@@ -3901,8 +4197,56 @@ class SoftphoneApp(QMainWindow):
         self.settings_win.show()
         self.settings_win.raise_()
         self.settings_win.activateWindow()
+        # Atualiza a lista de dispositivos enquanto a janela está visível
+        # (USB/Bluetooth plugado depois de abrir). Para quando some da tela
+        # (isVisible() False), evitando vazamento de timer.
+        if self._devs_timer is None:
+            self._devs_timer = QTimer(self)
+            self._devs_timer.setInterval(2000)
+            self._devs_timer.timeout.connect(self._on_devices_timer)
+        self._devs_timer.start()
+
+    def _on_devices_timer(self):
+        if self.settings_win is None or not self.settings_win.isVisible():
+            if self._devs_timer is not None:
+                self._devs_timer.stop()
+            return
+        self._refresh_device_combos()
+
+    def _refresh_device_combos(self):
+        # Reenumera SÓ o áudio e repopula os combos, preservando a seleção
+        # atual quando o device ainda existe. NÃO reaplica nada.
+        if self.settings_win is None or self.endpoint is None:
+            return
+        try:
+            devs = list(self.endpoint.audDevManager().enumDev2())
+        except Exception as e:
+            logging.debug("Falha ao reenumerar dispositivos: %s", e)
+            return
+        ins = [f"{i} | {d.name}" for i, d in enumerate(devs) if getattr(d, "inputCount", 0)]
+        outs = [f"{i} | {d.name}" for i, d in enumerate(devs) if getattr(d, "outputCount", 0)]
+        self._cached_ins = ins
+        self._cached_outs = outs
+        self._refill_combo(self.input_devices, ins)
+        self._refill_combo(self.output_devices, outs)
+
+    @staticmethod
+    def _refill_combo(combo, items):
+        if combo is None:
+            return
+        current = combo.currentText()
+        combo.blockSignals(True)
+        try:
+            combo.clear()
+            combo.addItems(items)
+            if current in items:
+                combo.setCurrentText(current)
+        finally:
+            combo.blockSignals(False)
 
     def _close_settings(self):
+        if self._devs_timer is not None:
+            self._devs_timer.stop()
         if self.settings_win is not None:
             self.settings_win.close()
             self.settings_win = None
@@ -4236,8 +4580,11 @@ class SoftphoneApp(QMainWindow):
         self.show_toast("Sincronização LDAP iniciada")
 
     def _update_ldap_ui(self):
-        if self.contacts_win is not None:
-            self._filter_contacts()
+        # Guarda dupla: a barra de busca pode ser None se a janela acabou de
+        # fechar entre a chegada do callback e o processamento na main thread.
+        if self.contacts_win is None or self.contact_search is None:
+            return
+        self._filter_contacts()
 
     def _save_feature_codes(self):
         if self.settings_win is None:
@@ -4662,6 +5009,12 @@ class SoftphoneApp(QMainWindow):
         if self._ringtone is not None or self._ringtone_player is not None:
             return
         path = self._ringtone_path()
+        # TO-DO (audio.ring_device): reproduzir o toque num dispositivo
+        # separado do de voz exigiria trocar setPlaybackDev durante o ring
+        # (e devolver depois), algo arriscado no pjsua2 — pode corromper a
+        # sessão se uma chamada chegar no meio. A chave audio.ring_device
+        # existe no config (default -1) e fica reservada para uso futuro;
+        # NÃO implementamos a troca por segurança.
         if path:
             try:
                 player = pj.AudioMediaPlayer()
@@ -4825,8 +5178,8 @@ class SoftphoneApp(QMainWindow):
         if self.current_audio_media is None:
             return
         try:
-            self.current_audio_media.adjustRxLevel(self.volume_out / 5.0)
-            self.current_audio_media.adjustTxLevel(self.volume_in / 5.0)
+            self.current_audio_media.adjustRxLevel(_volume_curve(self.volume_out))
+            self.current_audio_media.adjustTxLevel(_volume_curve(self.volume_in))
         except Exception as e:
             logging.error("Erro ao ajustar volume: %s", e)
 
@@ -5209,19 +5562,55 @@ class SoftphoneApp(QMainWindow):
         if self.endpoint is None:
             self._info("Backend SIP", "Backend SIP indisponível neste sistema; nada a aplicar.")
             return
+        in_text = self.input_devices.currentText()
+        out_text = self.output_devices.currentText()
+        try:
+            cap_idx = int(in_text.split(" | ")[0]) if in_text else -1
+        except (TypeError, ValueError):
+            cap_idx = -1
+        try:
+            play_idx = int(out_text.split(" | ")[0]) if out_text else -1
+        except (TypeError, ValueError):
+            play_idx = -1
         try:
             adm = self.endpoint.audDevManager()
-            sel = self.input_devices.currentText()
-            if sel:
-                adm.setCaptureDev(int(sel.split(" | ")[0]))
-            sel = self.output_devices.currentText()
-            if sel:
-                adm.setPlaybackDev(int(sel.split(" | ")[0]))
-            logging.info("Dispositivos aplicados: entrada=%s saída=%s",
-                         self.input_devices.currentText(), self.output_devices.currentText())
+            devs = list(adm.enumDev2())
+        except Exception as e:
+            logging.error("Erro ao reenumerar dispositivos: %s", e)
+            self._error("Erro", f"Falha ao reenumerar dispositivos: {pj_error_text(e)}")
+            return
+        # Hotplug: o device selecionado pode ter sumido desde que a lista foi
+        # montada; fica claro em vez de aplicar um índice inválido em silêncio.
+        if cap_idx >= 0 and cap_idx >= len(devs):
+            logging.warning("Dispositivo de entrada selecionado sumiu (índice %s)", cap_idx)
+            self._error(
+                "Dispositivo ausente",
+                "O dispositivo de entrada selecionado não está mais disponível.\n"
+                "A lista foi atualizada; escolha novamente.",
+            )
+            self.load_devices()
+            return
+        if play_idx >= 0 and play_idx >= len(devs):
+            logging.warning("Dispositivo de saída selecionado sumiu (índice %s)", play_idx)
+            self._error(
+                "Dispositivo ausente",
+                "O dispositivo de saída selecionado não está mais disponível.\n"
+                "A lista foi atualizada; escolha novamente.",
+            )
+            self.load_devices()
+            return
+        try:
+            if in_text:
+                adm.setCaptureDev(cap_idx)
+            if out_text:
+                adm.setPlaybackDev(play_idx)
+            logging.info(
+                "Dispositivos aplicados: captura=%s saída=%s",
+                cap_idx, play_idx,
+            )
         except Exception as e:
             logging.error("Erro ao aplicar dispositivos: %s", e)
-            self._error("Erro", f"Falha ao aplicar dispositivos: {e}")
+            self._error("Erro", f"Falha ao aplicar dispositivos: {pj_error_text(e)}")
 
     def apply_camera(self):
         if self.endpoint is None:
@@ -5759,12 +6148,19 @@ class SoftphoneApp(QMainWindow):
         if lt != -1 and gt != -1 and gt > lt:
             s = s[lt + 1:gt].strip()
         else:
-            i = s.lower().rfind("sip:")
+            i = max(
+                s.lower().rfind("sips:"),
+                s.lower().rfind("sip:"),
+                s.lower().rfind("tel:"),
+            )
             if i != -1:
                 s = s[i:]
             s = s.strip('"').strip()
-        if s.lower().startswith("sip:"):
-            s = s[4:]
+        # normaliza schemas: sips:/tel: têm o mesmo tratamento de sip:
+        for prefix in ("sips:", "sip:", "tel:"):
+            if s.lower().startswith(prefix):
+                s = s[len(prefix):]
+                break
         s = s.split(";", 1)[0]
         if "@" in s:
             s = s.rsplit("@", 1)[0]
@@ -6232,11 +6628,28 @@ class SoftphoneApp(QMainWindow):
                 self._theme_proc = None
             if self.recording:
                 self._stop_recording()
+            # Interrompe/aguarda threads de segundo plano antes de encerrar:
+            # download de atualização, checagem/provisioning e LDAP.
+            if getattr(self, "_update_downloading", False):
+                try:
+                    self._update_cancel_event.set()
+                except Exception:
+                    pass
+            for thread in (
+                getattr(self, "_update_download_thread", None),
+                getattr(self, "_update_thread", None),
+                getattr(self, "_prov_thread", None),
+            ):
+                if thread is not None and thread.is_alive():
+                    thread.join(timeout=2.0)
             if self.ldap_manager is not None:
                 try:
                     self.ldap_manager.close()
                 except Exception:
                     pass
+                ldap_thread = getattr(self.ldap_manager, "_thread", None)
+                if ldap_thread is not None and ldap_thread.is_alive():
+                    ldap_thread.join(timeout=2.0)
             if self._hotkeys is not None:
                 try:
                     self._hotkeys.stop()
@@ -6253,6 +6666,11 @@ class SoftphoneApp(QMainWindow):
             self._stop_ringback(reason="aplicativo encerrando")
             self._stop_ringtone()
             self._stop_test_player()
+            if self._devs_timer is not None:
+                try:
+                    self._devs_timer.stop()
+                except Exception:
+                    pass
             self._restore_key_style()
             self._stop_key_tone()
             self._stop_preview()
@@ -6273,7 +6691,7 @@ class SoftphoneApp(QMainWindow):
             self.calls.clear()
             for entry in self.accounts:
                 try:
-                    entry["acc"].delete()
+                    entry["acc"].shutdown()
                 except Exception:
                     pass
             if self.endpoint:
@@ -6457,8 +6875,11 @@ class SoftphoneApp(QMainWindow):
                 self._ui(self._error, "Atualização", f"Falha ao baixar a atualização:\n{e}")
             finally:
                 self._update_downloading = False
+                self._update_download_thread = None
 
-        threading.Thread(target=worker, name="updater-download", daemon=True).start()
+        t = threading.Thread(target=worker, name="updater-download", daemon=True)
+        self._update_download_thread = t
+        t.start()
 
     def _make_update_progress(self):
         dlg = QProgressDialog(
@@ -6522,8 +6943,15 @@ class SoftphoneApp(QMainWindow):
         def worker():
             try:
                 self._updater.check(url, uc.get("auth_user", ""))
-                self._ui(self._on_menu_update_result,
-                         self._updater.latest, self._updater.local_version, None)
+                # Só chama o callback quando há resposta remota: latest None
+                # (sem payload válido) não pode entrar em _on_menu_update_result.
+                if self._updater.latest is not None:
+                    self._ui(self._on_menu_update_result,
+                             self._updater.latest, self._updater.local_version, None)
+                else:
+                    logging.warning(
+                        "Verificação de atualização retornou sem resposta remota"
+                    )
             except Exception as e:
                 logging.info("Checagem de atualização (menu) falhou: %s", e)
                 self._ui(self._on_menu_update_result, None, self._updater.local_version, str(e))
@@ -6536,6 +6964,14 @@ class SoftphoneApp(QMainWindow):
             self._error(
                 "Verificar atualização",
                 f"Não foi possível consultar a versão remota:\n\n{error}\n\n"
+                "Verifique sua conexão com a internet.",
+            )
+            return
+        if info is None:
+            # Guarda defensiva: latest pode ser None se o payload vier vazio.
+            self._error(
+                "Verificar atualização",
+                "Não foi possível consultar a versão remota (resposta vazia).\n\n"
                 "Verifique sua conexão com a internet.",
             )
             return
@@ -6626,7 +7062,7 @@ class SoftphoneApp(QMainWindow):
         pv.addRow("URL", self.prov_url)
         self.prov_user = QLineEdit(str(pc.get("auth_user") or ""))
         pv.addRow("Usuário", self.prov_user)
-        self.prov_pass = QLineEdit(str(pc.get("auth_pass") or ""))
+        self.prov_pass = QLineEdit(str(secrets.get("provision_auth", "")))
         self.prov_pass.setEchoMode(QLineEdit.EchoMode.Password)
         pv.addRow("Senha", self.prov_pass)
         self.prov_interval = QSpinBox()
@@ -6645,7 +7081,7 @@ class SoftphoneApp(QMainWindow):
         self.cti_port.setRange(1, 65535)
         self.cti_port.setValue(int(cc.get("port", 9020)))
         cv.addRow("Porta", self.cti_port)
-        self.cti_token = QLineEdit(str(cc.get("token") or ""))
+        self.cti_token = QLineEdit(str(secrets.get("cti_token", "")))
         self.cti_token.setEchoMode(QLineEdit.EchoMode.Password)
         self.cti_token.setPlaceholderText("Token opcional (X-Auth-Token)")
         cv.addRow("Token", self.cti_token)
@@ -6657,17 +7093,26 @@ class SoftphoneApp(QMainWindow):
     def _save_provision_settings(self):
         if self.prov_win is None:
             return
+        prov_pass = self.prov_pass.text().strip()
+        if prov_pass:
+            secrets.set("provision_auth", prov_pass)
         self.config_data["provisioning"] = {
             "enabled": bool(self.prov_enabled.isChecked()),
             "url": self.prov_url.text().strip(),
             "auth_user": self.prov_user.text().strip(),
-            "auth_pass": self.prov_pass.text().strip() or (self.config_data.get("provisioning") or {}).get("auth_pass", ""),
+            # placeholder: o valor real fica só no cofre (secrets); o
+            # save_config nunca grava provisioning.auth_pass em disco.
+            "auth_pass": "",
             "sync_interval": int(self.prov_interval.value()),
         }
+        cti_token = self.cti_token.text().strip()
+        if cti_token:
+            secrets.set("cti_token", cti_token)
         self.config_data["cti"] = {
             "enabled": bool(self.cti_enabled.isChecked()),
             "port": int(self.cti_port.value()),
-            "token": self.cti_token.text().strip(),
+            # placeholder: token real apenas no cofre (secrets).
+            "token": "",
         }
         save_config(self.config_data)
         self._stop_provision_polling()
@@ -6690,7 +7135,10 @@ class SoftphoneApp(QMainWindow):
             return
         try:
             from .cti_api import CtiServer
-            self._cti = CtiServer(self, port=cc.get("port", 9020), token=cc.get("token", ""))
+            # token pode ter sido zerado no disco (nunca grava plaintext):
+            # cai para o valor real guardado no cofre (secrets).
+            token = cc.get("token", "") or secrets.get("cti_token", "")
+            self._cti = CtiServer(self, port=cc.get("port", 9020), token=token)
             self._cti.start()
         except Exception as e:
             logging.warning("Não foi possível iniciar a API CTI: %s", e)
@@ -6718,6 +7166,10 @@ class SoftphoneApp(QMainWindow):
         self._ui(wrapper)
         done.wait(5)
         if not done.is_set():
+            logging.warning(
+                "cti_invoke: main thread não respondeu em 5s (fila de UI parada?); "
+                "devolvendo erro ao cliente CTI"
+            )
             return (False, "Tempo esgotado aguardando a main thread")
         return result[0]
 

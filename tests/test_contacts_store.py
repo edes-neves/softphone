@@ -33,3 +33,18 @@ def test_contacts_load_filters_malformed(tmp_path):
     loaded = store.load()
     assert len(loaded) == 1
     assert loaded[0]["number"] == "1"
+
+
+def test_contacts_save_atomic(tmp_path):
+    path = tmp_path / "contacts.json"
+    store = ContactsStore(path=str(path))
+    contact = {"name": "João", "number": "3000", "server": "", "favorite": True,
+               "ringtone": "", "monitor_presence": False}
+    store.save([contact])
+    # regravação não deixa arquivo temporário nem corrompe o arquivo
+    store.save([{**contact, "number": "4000"}])
+    leftovers = [p.name for p in tmp_path.iterdir() if p.name.startswith(".contacts-")]
+    assert leftovers == []
+    loaded = store.load()
+    assert len(loaded) == 1
+    assert loaded[0]["number"] == "4000"

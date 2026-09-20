@@ -267,3 +267,118 @@ def test_clean_updater_default_url():
     assert config._clean_updater({"enabled": False})["enabled"] is False
     # url explícita não é sobrescrita
     assert config._clean_updater({"url": "https://servidor/x.json"})["url"] == "https://servidor/x.json"
+
+
+def test_provisioning_interval_migration():
+    # chave legada interval_min (minutos) -> canônica sync_interval (segundos)
+    p = config._clean_provisioning({"interval_min": 30})
+    assert p["sync_interval"] == 1800
+    assert p["interval_min"] == 30  # mantida por compatibilidade
+    # canônica é preservada como está
+    p = config._clean_provisioning({"sync_interval": 7200})
+    assert p["sync_interval"] == 7200
+    assert p["interval_min"] == 120
+    # defaults e limite inferior
+    assert config._clean_provisioning(None)["sync_interval"] == 3600
+    assert config._clean_provisioning({"sync_interval": 10})["sync_interval"] == 60
+    # sync_interval presente tem precedência sobre o legado
+    p = config._clean_provisioning({"interval_min": 30, "sync_interval": 900})
+    assert p["sync_interval"] == 900
+
+
+def test_config_no_sensitive_keys_in_file(tmp_path, monkeypatch):
+    monkeypatch.setattr(config, "CONFIG_DIR", str(tmp_path), raising=False)
+    monkeypatch.setattr(config, "CONFIG_FILE", str(tmp_path / "config.json"), raising=False)
+    sec = FakeSecrets()
+    cfg = config._default_config(sec)
+    cfg["nat"]["turn_password"] = "segredo-nat"
+    cfg["ldap"]["bind_password"] = "segredo-ldap"
+    cfg["provisioning"]["auth_pass"] = "segredo-prov"
+    cfg["cti"]["token"] = "segredo-cti"
+    cfg["updater"]["auth_pass"] = "segredo-upd"
+    snapshot = json.dumps(cfg, sort_keys=True)
+
+    config.save_config(cfg)
+
+    with open(config.CONFIG_FILE, encoding="utf-8") as f:
+        raw = json.load(f)
+    blob = json.dumps(raw)
+    for secret in ("segredo-nat", "segredo-ldap", "segredo-prov",
+                   "segredo-cti", "segredo-upd"):
+        assert secret not in blob
+    assert "turn_password" not in raw.get("nat", {})
+    assert "auth_pass" not in raw.get("provisioning", {})
+    assert "token" not in raw.get("cti", {})
+    assert "auth_pass" not in raw.get("updater", {})
+    assert "bind_password" not in raw.get("ldap", {})
+    # o dict do chamador NÃO foi mutado
+    assert cfg["nat"]["turn_password"] == "segredo-nat"
+    assert json.dumps(cfg, sort_keys=True) == snapshot
+
+
+def test_load_config_moves_legacy_secrets_to_store(tmp_path, monkeypatch):
+    monkeypatch.setattr(config, "CONFIG_DIR", str(tmp_path), raising=False)
+    monkeypatch.setattr(config, "CONFIG_FILE", str(tmp_path / "config.json"), raising=False)
+    with open(config.CONFIG_FILE, "w", encoding="utf-8") as f:
+        json.dump({
+            "provisioning": {"auth_pass": "pv"},
+            "cti": {"token": "tk"},
+            "updater": {"auth_pass": "up"},
+            "ldap": {"bind_password": "lb"},
+        }, f)
+    sec = FakeSecrets()
+    loaded = config.load_config(sec)
+    assert sec.get("provision_auth") == "pv"
+    assert sec.get("cti_token") == "tk"
+    assert sec.get("updater_auth") == "up"
+    assert sec.get("ldap_bind") == "lb"
+    # config normalizada não carrega nenhum segredo
+    assert loaded["provisioning"].get("auth_pass") is None
+    assert loaded["cti"]["token"] == ""
+
+
+def test_clean_audio_defaults():
+    a = config._clean_audio(None)
+    assert a == {
+        "aec_enabled": True, "aec_tail_ms": 200,
+        "agc_capture": True, "agc_playback": False,
+        "vad": True, "ring_device": -1,
+    }
+    # config antiga sem a chave "audio": defaults intactos
+    cfg = config._default_config(FakeSecrets())
+    assert cfg["audio"]["aec_enabled"] is True
+
+
+def test_clean_audio_values_and_clamps():
+    a = config._clean_audio({
+        "aec_enabled": "false", "aec_tail_ms": "400",
+        "agc_capture": False, "agc_playback": "true",
+        "vad": "false", "ring_device": "3",
+    })
+    assert a["aec_enabled"] is False
+    assert a["aec_tail_ms"] == 400
+    assert a["agc_capture"] is False
+    assert a["agc_playback"] is True
+    assert a["vad"] is False
+    assert a["ring_device"] == 3
+    # limites e valores inválidos
+    assert config._clean_audio({"aec_tail_ms": 99999})["aec_tail_ms"] == 500
+    assert config._clean_audio({"aec_tail_ms": -5})["aec_tail_ms"] == 0
+    assert config._clean_audio({"aec_tail_ms": "abc"})["aec_tail_ms"] == 200
+    assert config._clean_audio({"ring_device": "x"})["ring_device"] == -1
+    assert config._clean_audio("lixo")["aec_enabled"] is True
+
+
+def test_audio_section_roundtrip(tmp_path, monkeypatch):
+    monkeypatch.setattr(config, "CONFIG_DIR", str(tmp_path), raising=False)
+    monkeypatch.setattr(config, "CONFIG_FILE", str(tmp_path / "config.json"), raising=False)
+    sec = FakeSecrets()
+    cfg = config._default_config(sec)
+    cfg["audio"] = {
+        "aec_enabled": False, "aec_tail_ms": 120,
+        "agc_capture": False, "agc_playback": True,
+        "vad": False, "ring_device": 2,
+    }
+    config.save_config(cfg)
+    loaded = config.load_config(sec)
+    assert loaded["audio"] == cfg["audio"]

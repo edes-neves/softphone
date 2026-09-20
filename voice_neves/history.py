@@ -2,6 +2,7 @@
 import json
 import logging
 import os
+import tempfile
 
 from .constants import DATA_DIR, HISTORY_FILE
 
@@ -27,8 +28,22 @@ def load_history():
 def save_history(history):
     try:
         os.makedirs(DATA_DIR, exist_ok=True)
-        with open(HISTORY_FILE, "w", encoding="utf-8") as f:
-            json.dump(history, f, indent=2, ensure_ascii=False)
+        # Escrita atômica: grava em arquivo temporário no mesmo diretório e
+        # troca por os.replace — interromper o processo no meio nunca corrompe
+        # o history.json (mesmo padrão de contacts.json/config).
+        tmp_path = None
+        try:
+            fd, tmp_path = tempfile.mkstemp(dir=DATA_DIR, prefix=".history-", suffix=".tmp")
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(history, f, indent=2, ensure_ascii=False)
+            os.replace(tmp_path, HISTORY_FILE)
+            tmp_path = None
+        finally:
+            if tmp_path and os.path.exists(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
     except OSError as e:
         logging.error("Falha ao gravar histórico: %s", e)
 

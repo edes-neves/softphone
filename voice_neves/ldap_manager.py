@@ -2,6 +2,7 @@
 import json
 import logging
 import os
+import tempfile
 import threading
 
 from .config import _clean_ldap
@@ -49,8 +50,20 @@ class LDAPManager:
     def _save_cache(self):
         try:
             os.makedirs(DATA_DIR, exist_ok=True)
-            with open(self._cache_path(), "w", encoding="utf-8") as f:
-                json.dump(self.cache, f, indent=2, ensure_ascii=False)
+            directory = os.path.dirname(os.path.abspath(self._cache_path())) or DATA_DIR
+            tmp_path = None
+            try:
+                fd, tmp_path = tempfile.mkstemp(dir=directory, prefix=".ldap-cache-", suffix=".tmp")
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    json.dump(self.cache, f, indent=2, ensure_ascii=False)
+                os.replace(tmp_path, self._cache_path())
+                tmp_path = None
+            finally:
+                if tmp_path and os.path.exists(tmp_path):
+                    try:
+                        os.remove(tmp_path)
+                    except OSError:
+                        pass
         except OSError as e:
             logging.warning("Falha ao salvar cache LDAP: %s", e)
 

@@ -1,12 +1,28 @@
 """Carregamento/gravacao e normalizacao da configuracao (camada pura)."""
+import copy
 import json
 import logging
 import os
 import tempfile
+import threading
 
 from .constants import CONFIG_DIR, CONFIG_FILE, LEGACY_CONFIG_FILE
 from .themes import THEMES
 from .utils import _as_bool, clean_extension, is_valid_extension, is_valid_server
+
+# Chaves sensíveis que NUNCA devem ser persistidas em config.json. Cada
+# entrada é "secao.chave"; os valores reais vivem somente no cofre (secrets).
+SENSITIVE_KEYS = (
+    "nat.turn_password",
+    "provisioning.auth_pass",
+    "cti.token",
+    "updater.auth_pass",
+    "ldap.bind_password",
+)
+
+# Serializa gravações concorrentes: two threads chamando save_config ao mesmo
+# tempo não podem truncar/escrever metade e corromper o config.json.
+_SAVE_LOCK = threading.Lock()
 
 
 def _account_key(acc):
@@ -139,18 +155,33 @@ def _clean_ldap(raw):
 
 
 def _clean_provisioning(raw):
-    """Normaliza a seção de provisioning (config remota) da configuração."""
+    """Normaliza a seção de provisioning (config remota) da configuração.
+
+    A chave canônica é ``sync_interval``, em SEGUNDOS (consumida por app.py).
+    ``interval_min`` (minutos) é mantido apenas como leitura legada: quando o
+    arquivo em disco só carrega ``interval_min``, o valor é convertido para
+    segundos no retorno (e o app continua escrevendo ``sync_interval``).
+    """
     if not isinstance(raw, dict):
         raw = {}
-    try:
-        interval = max(5, min(1440, int(raw.get("interval_min", 60))))
-    except (TypeError, ValueError):
-        interval = 60
+    if raw.get("sync_interval") is None and raw.get("interval_min") is not None:
+        try:
+            # converte minutos → segundos ANTES de aplicar o piso de 60 s
+            interval_sec = max(60, int(raw["interval_min"]) * 60)
+        except (TypeError, ValueError):
+            interval_sec = 3600
+    else:
+        try:
+            interval_sec = max(60, int(raw.get("sync_interval", 3600)))
+        except (TypeError, ValueError):
+            interval_sec = 3600
     return {
         "enabled": _as_bool(raw.get("enabled")),
         "url": str(raw.get("url") or "").strip(),
         "auth_user": str(raw.get("auth_user") or "").strip(),
-        "interval_min": interval,
+        "sync_interval": interval_sec,
+        # mantida por compatibilidade com leitores do formato antigo (min)
+        "interval_min": interval_sec // 60,
     }
 
 
@@ -229,6 +260,34 @@ def _clean_dtmf(raw):
     }
 
 
+def _clean_audio(raw):
+    """Normaliza a seção de áudio (AEC, AGC, VAD, ring device).
+
+    Configurações antigas (sem a chave ``audio``) caem nos defaults: o app
+    continua exatamente como antes. ``ring_device`` é reservado para uso
+    futuro (reproduzir o toque num dispositivo separado do de voz); -1 =
+    usar o mesmo da voz.
+    """
+    if not isinstance(raw, dict):
+        raw = {}
+    try:
+        aec_tail = max(0, min(500, int(raw.get("aec_tail_ms", 200))))
+    except (TypeError, ValueError):
+        aec_tail = 200
+    try:
+        ring_device = int(raw.get("ring_device", -1))
+    except (TypeError, ValueError):
+        ring_device = -1
+    return {
+        "aec_enabled": _as_bool(raw.get("aec_enabled", True)),
+        "aec_tail_ms": aec_tail,
+        "agc_capture": _as_bool(raw.get("agc_capture", True)),
+        "agc_playback": _as_bool(raw.get("agc_playback", False)),
+        "vad": _as_bool(raw.get("vad", True)),
+        "ring_device": ring_device,
+    }
+
+
 def _default_config(secrets):
     return {
         "accounts": [],
@@ -247,6 +306,7 @@ def _default_config(secrets):
         "security": _clean_security(None),
         "nat": _clean_nat(None, secrets),
         "video": _clean_video(None),
+        "audio": _clean_audio(None),
         "provisioning": _clean_provisioning(None),
         "updater": _clean_updater(None),
         "cti": _clean_cti(None),
@@ -290,6 +350,33 @@ def load_config(secrets):
     try:
         with open(CONFIG_FILE, encoding="utf-8") as f:
             data = json.load(f)
+        # Migração de segredos legados (configs antigas podiam persistir
+        # valores em plaintext): move para o cofre (secrets) e zera no dict
+        # que fica em memória para o restante do carregamento.
+        raw_prov = data.get("provisioning")
+        if isinstance(raw_prov, dict):
+            legacy = str(raw_prov.get("auth_pass") or "").strip()
+            if legacy:
+                secrets.set("provision_auth", legacy)
+                raw_prov["auth_pass"] = ""
+        raw_cti = data.get("cti")
+        if isinstance(raw_cti, dict):
+            legacy = str(raw_cti.get("token") or "").strip()
+            if legacy:
+                secrets.set("cti_token", legacy)
+                raw_cti["token"] = ""
+        raw_upd = data.get("updater")
+        if isinstance(raw_upd, dict):
+            legacy = str(raw_upd.get("auth_pass") or "").strip()
+            if legacy:
+                secrets.set("updater_auth", legacy)
+                raw_upd["auth_pass"] = ""
+        raw_ldap = data.get("ldap")
+        if isinstance(raw_ldap, dict):
+            legacy = str(raw_ldap.get("bind_password") or "").strip()
+            if legacy:
+                secrets.set("ldap_bind", legacy)
+                raw_ldap["bind_password"] = ""
         codecs = data.get("codecs")
         if not isinstance(codecs, dict) or not isinstance(codecs.get("audio"), dict):
             codecs = {"audio": {}, "video": {}}
@@ -318,6 +405,7 @@ def load_config(secrets):
             "security": _clean_security(data.get("security")),
             "nat": _clean_nat(data.get("nat"), secrets),
             "video": _clean_video(data.get("video")),
+            "audio": _clean_audio(data.get("audio")),
             "provisioning": _clean_provisioning(data.get("provisioning")),
             "updater": _clean_updater(data.get("updater")),
             "cti": _clean_cti(data.get("cti")),
@@ -331,33 +419,37 @@ def load_config(secrets):
 
 
 def save_config(data):
-    try:
-        os.makedirs(CONFIG_DIR, exist_ok=True)
-    except OSError as e:
-        logging.error("Falha ao criar %s: %s", CONFIG_DIR, e)
-        return
+    # Serializa chamadas concorrentes e opera numa CÓPIA profunda: o dict do
+    # chamador nunca é mutado pelos strips de SENSITIVE_KEYS abaixo.
+    with _SAVE_LOCK:
+        try:
+            os.makedirs(CONFIG_DIR, exist_ok=True)
+        except OSError as e:
+            logging.error("Falha ao criar %s: %s", CONFIG_DIR, e)
+            return
 
-    payload = dict(data)
-    nat = payload.get("nat")
-    if isinstance(nat, dict):
-        nat = dict(nat)
-        nat.pop("turn_password", None)
-        payload["nat"] = nat
+        payload = copy.deepcopy(data)
+        for dotted in SENSITIVE_KEYS:
+            section, _, key = dotted.partition(".")
+            section_data = payload.get(section)
+            if isinstance(section_data, dict):
+                # segredos nunca vão para disco; vivem somente no cofre
+                section_data.pop(key, None)
 
-    tmp_path = None
-    try:
-        fd, tmp_path = tempfile.mkstemp(dir=CONFIG_DIR, prefix=".config-", suffix=".tmp")
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(payload, f, indent=4, ensure_ascii=False)
-        os.replace(tmp_path, CONFIG_FILE)
-        os.chmod(CONFIG_FILE, 0o600)
-    except OSError as e:
-        logging.error("Falha ao gravar config: %s", e)
-    finally:
-        if tmp_path and os.path.exists(tmp_path):
-            try:
-                os.remove(tmp_path)
-            except OSError:
-                pass
+        tmp_path = None
+        try:
+            fd, tmp_path = tempfile.mkstemp(dir=CONFIG_DIR, prefix=".config-", suffix=".tmp")
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(payload, f, indent=4, ensure_ascii=False)
+            os.replace(tmp_path, CONFIG_FILE)
+            os.chmod(CONFIG_FILE, 0o600)
+        except OSError as e:
+            logging.error("Falha ao gravar config: %s", e)
+        finally:
+            if tmp_path and os.path.exists(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
 
 

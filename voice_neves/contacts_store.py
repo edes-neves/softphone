@@ -2,6 +2,7 @@
 import json
 import logging
 import os
+import tempfile
 
 from .constants import CONTACTS_FILE, DATA_DIR
 
@@ -41,8 +42,23 @@ class ContactsStore:
     def save(self, contacts):
         try:
             os.makedirs(DATA_DIR, exist_ok=True)
-            with open(self.path, "w", encoding="utf-8") as f:
-                json.dump(contacts, f, indent=2, ensure_ascii=False)
+            # Escrita atômica: grava em arquivo temporário no mesmo diretório
+            # e troca por os.replace — interromper o processo no meio nunca
+            # corrompe o contacts.json (mesmo padrão de config/history).
+            directory = os.path.dirname(os.path.abspath(self.path)) or DATA_DIR
+            tmp_path = None
+            try:
+                fd, tmp_path = tempfile.mkstemp(dir=directory, prefix=".contacts-", suffix=".tmp")
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    json.dump(contacts, f, indent=2, ensure_ascii=False)
+                os.replace(tmp_path, self.path)
+                tmp_path = None
+            finally:
+                if tmp_path and os.path.exists(tmp_path):
+                    try:
+                        os.remove(tmp_path)
+                    except OSError:
+                        pass
         except OSError as e:
             logging.error("Falha ao gravar contatos: %s", e)
 

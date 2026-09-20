@@ -3,6 +3,7 @@
 Importa a UI por dentro de main() para que setup_logging() rode antes da
 construcao do SecretsStore (runtime).
 """
+import logging
 import os
 import sys
 
@@ -55,7 +56,15 @@ def main():
     app.show()
     rc = qapp.exec()
     # Threads de audio/pjsua podem manter o interpretador vivo apos o
-    # mainloop; encerra de vez para nao sobrar processo invisivel.
+    # mainloop; encerra de vez para nao sobrar processo invisivel. Antes,
+    # esvazia todos os buffers de log/console: os._exit() nao roda os
+    # registradores do interpreter (atexit, flush de stdout/stderr).
+    logging.shutdown()
+    try:
+        sys.stdout.flush()
+        sys.stderr.flush()
+    except Exception:
+        pass
     os._exit(rc)
 
 

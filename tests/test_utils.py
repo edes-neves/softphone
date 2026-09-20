@@ -165,3 +165,39 @@ def test_phone_matches_equal_and_suffix():
 def test_phone_matches_avoids_short_false_positive():
     assert utils.phone_matches("1300", "300") is False  # só 3 dígitos
     assert utils.phone_matches("300", "1300") is False
+
+
+def test_failover_target_sem_backup_nao_troca():
+    assert utils.failover_target("pbx.a", "pbx.a", "", 0.0, 30, 100.0) == ""
+    assert utils.failover_target("pbx.a", "pbx.a", None, 0.0, 30, 100.0) == ""
+
+
+def test_failover_target_backup_igual_primario_nao_troca():
+    assert utils.failover_target("pbx.a", "pbx.a", "pbx.a", 0.0, 30, 100.0) == ""
+
+
+def test_failover_target_ignora_cooldown_quando_nunca_tentou():
+    assert utils.failover_target("pbx.a", "pbx.a", "pbx.b", None, 30, 100.0) == "pbx.b"
+    assert utils.failover_target("pbx.a", "pbx.a", "pbx.b", 0.0, 30, 100.0) == "pbx.b"
+
+
+def test_failover_target_bloqueado_no_cooldown():
+    # última tentativa há 10s e cooldown de 30s: ainda não pode trocar
+    assert utils.failover_target("pbx.a", "pbx.a", "pbx.b", 90.0, 30, 100.0) == ""
+
+
+def test_failover_target_troca_apos_cooldown():
+    # última tentativa há 40s, cooldown de 30s: pode trocar
+    assert utils.failover_target("pbx.a", "pbx.a", "pbx.b", 60.0, 30, 100.0) == "pbx.b"
+
+
+def test_failover_target_alterna_entre_primario_e_backup():
+    # no primário, falhou -> alvo é o backup
+    assert utils.failover_target("pbx.a", "pbx.a", "pbx.b", 0.0, 30, 100.0) == "pbx.b"
+    # no backup, falhou -> alvo volta para o primário
+    assert utils.failover_target("pbx.b", "pbx.a", "pbx.b", 0.0, 30, 100.0) == "pbx.a"
+
+
+def test_failover_target_ignora_cooldown_invalido():
+    assert utils.failover_target("pbx.a", "pbx.a", "pbx.b", "lixo", 30, 100.0) == "pbx.b"
+    assert utils.failover_target("pbx.a", "pbx.a", "pbx.b", None, 30, "lixo") == "pbx.b"

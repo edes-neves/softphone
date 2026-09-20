@@ -26,3 +26,17 @@ def test_load_history_filters_malformed(tmp_path, monkeypatch):
     loaded = history.load_history()
     assert len(loaded) == 1
     assert loaded[0]["label"] == "x"
+
+
+def test_save_history_atomic(tmp_path, monkeypatch):
+    monkeypatch.setattr(history, "DATA_DIR", str(tmp_path), raising=False)
+    monkeypatch.setattr(history, "HISTORY_FILE", str(tmp_path / "history.json"), raising=False)
+    data = [{"ts": "01/01/2026 10:00", "label": "Saída para 3000", "kind": "outgoing"}]
+    history.save_history(data)
+    # regravação não deixa arquivo temporário nem corrompe o arquivo final
+    history.save_history([{**data[0], "label": "Saída para 4000"}])
+    leftovers = [p.name for p in tmp_path.iterdir() if p.name.startswith(".history-")]
+    assert leftovers == []
+    loaded = history.load_history()
+    assert len(loaded) == 1
+    assert loaded[0]["label"] == "Saída para 4000"

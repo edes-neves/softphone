@@ -46,6 +46,13 @@ def test_parse_provision_invalid_payload():
         provisioning.parse_provision([1, 2, 3])
 
 
+def test_parse_provision_keeps_version():
+    raw = {"version": 7, "accounts": [{"user": "100", "server": "s.ex"}]}
+    assert provisioning.parse_provision(raw)["version"] == 7
+    # payload sem campo version → None (não inventa versão)
+    assert provisioning.parse_provision({"accounts": []})["version"] is None
+
+
 def test_payload_checksum_deterministic(tmp_path):
     p1 = provisioning.parse_provision({"accounts": [{"user": "a", "server": "s"}]})
     p2 = provisioning.parse_provision({"accounts": [{"server": "s", "user": "a"}]})

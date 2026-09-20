@@ -203,6 +203,39 @@ def _as_bool(value):
     return str(value).strip().lower() in ("1", "true", "yes", "on")
 
 
+# =========================
+# FAILOVER DE SERVIDOR SIP
+# =========================
+
+def failover_target(current, primary, backup, last_attempt, cooldown_sec, now):
+    """Decide se/para onde fazer failover do registro SIP.
+
+    Quando o registro falha no servidor ativo, o app tenta o servidor de
+    backup (e vice-versa), mas respeitando um cooldown para não recriar a
+    conta em loop infinito (senha errada + backup inalcançável não pode virar
+    um turbilhão de re-registros).
+
+    Retorna o servidor alvo (string) quando o failover deve acontecer agora,
+    ou "" quando não deve trocar (sem backup, alvo inválido, ou cooldown ainda
+    ativo).
+    """
+    primary = str(primary or "").strip()
+    backup = str(backup or "").strip()
+    if not backup or backup == primary:
+        return ""
+    current = str(current or "").strip()
+    if last_attempt is not None:
+        try:
+            if now - float(last_attempt) < float(cooldown_sec):
+                return ""
+        except (TypeError, ValueError):
+            pass
+    target = backup if current == primary else primary
+    if not target or target == current:
+        return ""
+    return target
+
+
 
 # =========================
 # MWI (Message Waiting Indicator)

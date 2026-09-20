@@ -79,7 +79,7 @@ def parse_provision(raw):
             }
         )
 
-    result = {"accounts": accounts}
+    result = {"version": raw.get("version"), "accounts": accounts}
     sec = raw.get("security")
     nat = raw.get("nat")
     if isinstance(sec, dict):
@@ -157,6 +157,11 @@ class ProvisioningManager:
           - payload: dict com 'accounts' (e opcional 'security'/'nat') validados
           - changed: True se diferente do último aplicado
           - from_cache: True se veio do cache (offline)
+
+        A versão do payload (campo "version") é preservada e comparada com a
+        última aplicada em cache; a versão aplicada só é registrada quando o
+        payload veio do servidor E realmente mudou (from_cache=False e
+        changed=True).
         """
         from_cache = False
         try:
@@ -168,8 +173,18 @@ class ProvisioningManager:
             if payload is None:
                 return None, False, True
 
+        version = payload.get("version")
+        applied_version = self._cache.get("version") if isinstance(self._cache, dict) else None
+        if version is not None and applied_version is not None and version != applied_version:
+            logging.warning(
+                "Provisioning: versão do payload (%s) difere da última aplicada (%s)",
+                version, applied_version,
+            )
         checksum = payload_checksum(payload)
         changed = checksum != self.last_checksum()
-        self._cache = {"checksum": checksum, "payload": payload}
+        new_cache = {"checksum": checksum, "payload": payload}
+        if not from_cache and changed:
+            new_cache["version"] = version
+        self._cache = new_cache
         self._save_cache()
         return payload, changed, from_cache

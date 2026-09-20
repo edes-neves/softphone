@@ -74,7 +74,15 @@ if _HAS_PJSUA2:
                 try:
                     remote = call.getInfo().remoteUri
                 except Exception:
-                    remote = prm.rdata.wholeMsg[:80]
+                    # Nunca logar o SIP bruto (rdata.wholeMsg) no fallback:
+                    # pode conter cabeçalhos sensíveis. Usa apenas o Call-ID.
+                    remote = "remoto-desconhecido"
+                    try:
+                        call_id = getattr(prm.rdata, "callId", None) or ""
+                        if str(call_id).strip():
+                            remote = f"remoto-desconhecido (call-id: {call_id})"
+                    except Exception:
+                        pass
                 logging.info("Chamada recebida de %s", remote)
                 self.app._ui(self.app.on_incoming, call)
 

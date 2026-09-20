@@ -106,7 +106,9 @@ def test_detect_no_capture_devices_disables_auto():
 
     acfg = _FakeAccountConfig()
     app_module.SoftphoneApp._apply_video_config(app, acfg)
-    assert acfg.videoConfig.autoShowIncoming is False
+    # RECEBER vídeo não exige câmera local: autoShowIncoming fica ligado sempre
+    # que há suporte a vídeo, mesmo sem dispositivo de captura utilizável.
+    assert acfg.videoConfig.autoShowIncoming is True
     assert acfg.videoConfig.autoTransmitOutgoing is False
     assert acfg.videoConfig.defaultCaptureDevice == -1
 
