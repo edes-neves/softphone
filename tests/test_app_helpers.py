@@ -300,3 +300,58 @@ def test_recreate_account_drops_buddy_refs():
     assert entry["acc"].shutdown_called  # shutdown da conta ainda ocorre
     assert sorted(destroyed) == ["A", "B"]  # wrappers destruídos por refcount
     assert entry["buddies"] == []  # sem referências penduradas
+
+
+def test_close_event_hides_to_tray_when_active():
+    # O X com bandeja ativa deve ignorar o fechamento e esconder a janela.
+    got = {}
+
+    class _FakeTray:
+        pass
+
+    self_ = types.SimpleNamespace(
+        _tray_icon=_FakeTray(),
+        hide=lambda: got.__setitem__("hide", True),
+        show_toast=lambda *a, **k: got.__setitem__("toast", True),
+        close=lambda: got.__setitem__("close", True),
+    )
+    event = types.SimpleNamespace(
+        ignore=lambda: got.__setitem__("ignore", True),
+        accept=lambda: got.__setitem__("accept", True),
+    )
+    app_module.SoftphoneApp.closeEvent(self_, event)
+    assert got.get("ignore") is True
+    assert got.get("hide") is True
+    assert got.get("close") is None
+
+
+def test_close_event_closes_when_no_tray():
+    # Sem bandeja, o X deve encerrar o aplicativo (fallback atual).
+    got = {}
+    self_ = types.SimpleNamespace(
+        _tray_icon=None,
+        hide=lambda: got.__setitem__("hide", True),
+        show_toast=lambda *a, **k: got.__setitem__("toast", True),
+        close=lambda: got.__setitem__("close", True),
+    )
+    event = types.SimpleNamespace(
+        ignore=lambda: got.__setitem__("ignore", True),
+        accept=lambda: got.__setitem__("accept", True),
+    )
+    app_module.SoftphoneApp.closeEvent(self_, event)
+    assert got.get("close") is True
+    assert got.get("ignore") is None
+
+
+def test_setup_tray_disabled_without_notification_area(monkeypatch):
+    # Sem área de notificação (offscreen/headless), a bandeja fica desativada
+    # e o app volta ao comportamento de fechar no X (sem crash).
+    self_ = types.SimpleNamespace(_tray_icon=object(), _tray_menu=object())
+    monkeypatch.setattr(
+        app_module.QSystemTrayIcon,
+        "isSystemTrayAvailable",
+        staticmethod(lambda: False),
+    )
+    app_module.SoftphoneApp._setup_tray(self_)
+    assert self_._tray_icon is None
+    assert self_._tray_menu is None

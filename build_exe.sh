@@ -49,9 +49,7 @@ log "Gerando executável..."
     --collect-submodules voice_neves \
     --collect-submodules keyring \
     --collect-data keyring \
-    --hidden-import pystray \
-    --hidden-import pynput \
-    --hidden-import PIL
+    --hidden-import pynput
 
 log "Pronto: dist/VoiceNeves/VoiceNeves"
 log "Teste: cd dist/VoiceNeves && ./VoiceNeves"

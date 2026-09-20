@@ -50,21 +50,12 @@ from PySide6.QtWidgets import (
     QTreeWidget, QTreeWidgetItem, QFrame, QLayout,
     QHBoxLayout, QVBoxLayout, QGridLayout, QFormLayout, QGroupBox,
     QTabWidget, QScrollArea, QSizePolicy, QAbstractItemView, QGraphicsDropShadowEffect,
-    QStyle, QProgressDialog,
+    QStyle, QProgressDialog, QMenu, QSystemTrayIcon,
 )
 
 from . import sip_backend
 from . import platform
 pj = sip_backend.import_pjsua2()
-
-try:
-    import pystray
-    from PIL import Image as PILImage
-    HAVE_TRAY = True
-except Exception:
-    pystray = None
-    PILImage = None
-    HAVE_TRAY = False
 
 try:
     from pynput import keyboard as pynput_keyboard
@@ -79,7 +70,7 @@ from .themes import THEMES
 from .platform import detect_system_theme
 from .runtime import secrets
 from .utils import (
-    resource_path, notify_send, is_wayland, appindicator_available,
+    resource_path, notify_send, is_wayland,
     clean_extension, is_valid_extension, is_valid_server,
     build_sip_target, format_phone, phone_matches, _as_bool, failover_target,
 )
@@ -1013,7 +1004,7 @@ class SoftphoneApp(QMainWindow):
         self._forward_timers = {}
 
         self._tray_icon = None
-        self._tray_thread = None
+        self._tray_menu = None
         self._hotkeys = None
         self._theme_proc = None
 
@@ -6467,41 +6458,55 @@ class SoftphoneApp(QMainWindow):
     # =========================
     def _setup_tray(self):
         self._tray_icon = None
-        self._tray_thread = None
-        if not HAVE_TRAY:
-            logging.info("pystray/PIL indisponíveis; bandeja do sistema desativada")
-            return
-        if is_wayland() and not appindicator_available():
-            logging.warning(
-                "Bandeja desativada: no Wayland é preciso o backend AppIndicator. "
-                "Instale 'gir1.2-ayatanaappindicator3-0.1' (e 'python3-gi' no ambiente), "
-                "e ative a extensão 'AppIndicator' do GNOME."
-            )
-            return
+        self._tray_menu = None
         try:
-            image = PILImage.open(resource_path("Icone.png"))
+            if QApplication.instance() is None:
+                logging.info("Sem QApplication; bandeja do sistema desativada")
+                return
+        except Exception:
+            pass
+        try:
+            tray_available = QSystemTrayIcon.isSystemTrayAvailable()
         except Exception as e:
-            logging.warning("Não foi possível carregar o ícone da bandeja (%s); usando padrão", e)
-            image = PILImage.new("RGB", (64, 64), (37, 99, 235))
-
-        menu = pystray.Menu(
-            pystray.MenuItem("Atender", self._tray_answer),
-            pystray.MenuItem("Desligar", self._tray_hangup),
-            pystray.MenuItem("Mute/Unmute", self._tray_mute),
-            pystray.MenuItem("Abrir", self._tray_open),
-            pystray.Menu.SEPARATOR,
-            pystray.MenuItem("Sair", self._tray_quit),
-        )
+            tray_available = False
+            logging.warning("Falha ao consultar a área de notificação: %s", e)
+        if not tray_available:
+            logging.info("Sistema sem área de notificação; bandeja do sistema desativada")
+            return
         try:
-            self._tray_icon = pystray.Icon("voiceneves", image, APP_NAME, menu)
-            self._tray_thread = threading.Thread(
-                target=self._tray_icon.run, name="pystray", daemon=True
-            )
-            self._tray_thread.start()
+            try:
+                icon = QIcon(resource_path("Icone.png"))
+            except Exception:
+                icon = QIcon()
+            menu = QMenu()
+            menu.addAction("Atender", self._answer_guarded)
+            menu.addAction("Desligar", self.hangup)
+            menu.addAction("Mute/Unmute", self.toggle_mute)
+            menu.addSeparator()
+            menu.addAction("Abrir", self._show_window)
+            menu.addSeparator()
+            menu.addAction("Sair", self.close)
+            self._tray_menu = menu
+            self._tray_icon = QSystemTrayIcon(icon, self)
+            self._tray_icon.setContextMenu(menu)
+            self._tray_icon.setToolTip(APP_NAME)
+            self._tray_icon.activated.connect(self._on_tray_activated)
+            self._tray_icon.show()
             logging.info("Bandeja do sistema ativada")
         except Exception as e:
             self._tray_icon = None
+            self._tray_menu = None
             logging.warning("Não foi possível iniciar a bandeja do sistema: %s", e)
+
+    def _on_tray_activated(self, reason):
+        try:
+            if reason in (
+                QSystemTrayIcon.ActivationReason.Trigger,
+                QSystemTrayIcon.ActivationReason.DoubleClick,
+            ):
+                self._show_window()
+        except Exception as e:
+            logging.warning("Falha ao tratar clique na bandeja: %s", e)
 
     def _on_minimize(self):
         try:
@@ -6526,21 +6531,6 @@ class SoftphoneApp(QMainWindow):
     def _answer_guarded(self):
         if self.call_state == "INCOMING":
             self.answer()
-
-    def _tray_answer(self, icon=None, item=None):
-        self._ui(self._answer_guarded)
-
-    def _tray_hangup(self, icon=None, item=None):
-        self._ui(self.hangup)
-
-    def _tray_mute(self, icon=None, item=None):
-        self._ui(self.toggle_mute)
-
-    def _tray_open(self, icon=None, item=None):
-        self._ui(self._show_window)
-
-    def _tray_quit(self, icon=None, item=None):
-        self._ui(self.close)
 
     def _setup_hotkeys(self):
         self._hotkeys = None
@@ -6658,10 +6648,11 @@ class SoftphoneApp(QMainWindow):
                 self._hotkeys = None
             if self._tray_icon is not None:
                 try:
-                    self._tray_icon.stop()
+                    self._tray_icon.hide()
                 except Exception:
                     pass
                 self._tray_icon = None
+            self._tray_menu = None
             self._close_transfer_win()
             self._stop_ringback(reason="aplicativo encerrando")
             self._stop_ringtone()
@@ -6704,7 +6695,7 @@ class SoftphoneApp(QMainWindow):
             pass
 
     def closeEvent(self, event):
-        if HAVE_TRAY and getattr(self, "_tray_icon", None) is not None:
+        if getattr(self, "_tray_icon", None) is not None:
             event.ignore()
             self.hide()
             self.show_toast("Voice Neves continua ativo na bandeja do sistema.")
