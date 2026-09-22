@@ -98,6 +98,8 @@ jobs:
       # version.json é a fonte de verdade da atualização automática. É gerado
       # com o sha256 real do AppImage, anexado à release e commitado no branch
       # padrão para ter uma URL estável e imutável (raw.githubusercontent.com).
+      # O formato contempla as duas plataformas: url_linux/url_win apontam para
+      # o binário de cada SO no mesmo version.json.
       - name: Gerar e publicar version.json
         if: startsWith(github.ref, 'refs/tags/v')
         env:
@@ -108,8 +110,20 @@ jobs:
           VERSION="${TAG#v}"
           SHA="$(sha256sum VoiceNeves-x86_64.AppImage | awk '{print $1}')"
           URL="https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/VoiceNeves-x86_64.AppImage"
-          printf '{"version":"%s","url":"%s","sha256":"%s"}\n' \
-            "$VERSION" "$URL" "$SHA" > version.json
+          # Windows: o .exe não é compilado pela CI; é publicado manualmente via
+          # `gh release upload "$TAG" VoiceNeves.exe` (e opcionalmente commitado na
+          # raiz). Quando presente, o sha256 é registrado para validar o checksum.
+          URL_WIN="https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/VoiceNeves.exe"
+          SHA_WIN=""
+          for EXE_PATH in "VoiceNeves.exe" "dist/VoiceNeves.exe"; do
+            if [ -f "$EXE_PATH" ]; then
+              SHA_WIN="$(sha256sum "$EXE_PATH" | awk '{print $1}')"
+              gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber "$EXE_PATH"
+              break
+            fi
+          done
+          printf '{"version":"%s","url":"%s","sha256":"%s","url_linux":"%s","sha256_linux":"%s","url_win":"%s","sha256_win":"%s"}\n' \
+            "$VERSION" "$URL" "$SHA" "$URL" "$SHA" "$URL_WIN" "$SHA_WIN" > version.json
           echo "== version.json =="
           cat version.json
           # 1) Anexa como asset da mesma release

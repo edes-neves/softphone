@@ -9,8 +9,16 @@ Formato do version.json servido (idealmente junto do provisioning):
     {
       "version": "1.1.0",
       "url": "https://meuservidor/downloads/VoiceNeves-1.1.0.AppImage",
-      "sha256": "<hex>"
+      "sha256": "<hex>",
+      "url_linux": "https://meuservidor/downloads/VoiceNeves-1.1.0.AppImage",
+      "sha256_linux": "<hex>",
+      "url_win": "https://meuservidor/downloads/VoiceNeves-1.1.0.exe",
+      "sha256_win": "<hex>"
     }
+
+`url`/`sha256` são o fallback genérico. As chaves `url_linux`/`sha256_linux`
+e `url_win`/`sha256_win` permitem oferecer binários diferentes por plataforma
+(ex.: AppImage no Linux e .exe no Windows) com o mesmo version.json.
 
 Se `sha256` estiver presente, o download é validado antes de ser considerado
 pronto para aplicar.
@@ -18,6 +26,7 @@ pronto para aplicar.
 import hashlib
 import json
 import os
+import sys
 import time
 import urllib.parse
 import urllib.request
@@ -60,18 +69,46 @@ def default_download_dir():
     return downloads_dir()
 
 
+def _is_windows():
+    """True quando a plataforma atual é Windows."""
+    return sys.platform.startswith("win")
+
+
+def _resolve_platform_artifact(raw):
+    """Escolhe url/sha256 conforme a plataforma atual.
+
+    Em Windows prioriza ``url_win`` (e ``sha256_win``); nas demais plataformas
+    (Linux/macOS) prioriza ``url_linux`` (e ``sha256_linux``). Quando a chave
+    específica não existe, volta para o par genérico ``url``/``sha256``.
+    """
+    if _is_windows():
+        url = str(raw.get("url_win") or "").strip()
+        if url:
+            return url, str(raw.get("sha256_win") or "").strip().lower()
+        url = str(raw.get("url_windows") or "").strip()
+        if url:
+            return url, str(raw.get("sha256_windows") or "").strip().lower()
+    else:
+        url = str(raw.get("url_linux") or "").strip()
+        if url:
+            return url, str(raw.get("sha256_linux") or "").strip().lower()
+    return str(raw.get("url") or "").strip(), str(raw.get("sha256") or "").strip().lower()
+
+
 def parse_version_info(raw):
     """Valida um payload de version.json."""
     if not isinstance(raw, dict):
         raise ValueError("Payload de versão inválido")
     version = str(raw.get("version") or "").strip()
-    url = str(raw.get("url") or "").strip()
-    if not version or not url:
-        raise ValueError("version.json sem 'version' ou 'url'")
+    if not version:
+        raise ValueError("version.json sem 'version'")
+    url, sha256 = _resolve_platform_artifact(raw)
+    if not url:
+        raise ValueError("version.json sem 'url'")
     return {
         "version": version,
         "url": url,
-        "sha256": str(raw.get("sha256") or "").strip().lower(),
+        "sha256": sha256,
     }
 
 
