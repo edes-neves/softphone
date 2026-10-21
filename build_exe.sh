@@ -1,17 +1,36 @@
 #!/usr/bin/env bash
-# build_exe.sh — Gera o executável VoiceNeves com PyInstaller.
-# Uso: ./build_exe.sh
+# build_exe.sh — Gera o executável VoiceNeves com PyInstaller (+ AppImage).
+# Uso: ./build_exe.sh [--no-sip]
+#   --no-sip  empacota SOMENTE a UI (sem pjsua2) — útil para testar o pacote
+#             antes de rodar ./build_pjsip.sh. Chamadas SIP ficam desativadas.
 set -Eeuo pipefail
 
-log() { printf '\n\033[1;34m[build_exe]\033[0m %s\n' "$*"; }
-err() { printf '\033[1;31m[ERRO]\033[0m %s\n' "$*" >&2; exit 1; }
+log()  { printf '\n\033[1;34m[build_exe]\033[0m %s\n' "$*"; }
+warn() { printf '\033[1;33m[AVISO]\033[0m %s\n' "$*"; }
+err()  { printf '\033[1;31m[ERRO]\033[0m %s\n' "$*" >&2; exit 1; }
 
 cd "$(dirname "$0")"
 PY=".venv/bin/python"
 
-[ -x "$PY" ] || err "venv não encontrado em .venv/"
+REQUIRE_SIP=1
+for arg in "$@"; do
+    case "$arg" in
+        --no-sip) REQUIRE_SIP=0 ;;
+        -h|--help)
+            sed -n '2,5p' "$0" | sed 's/^# \{0,1\}//'
+            exit 0 ;;
+        *) err "opção desconhecida: $arg (use --help)" ;;
+    esac
+done
+
+[ -x "$PY" ] || err "venv não encontrado em .venv/
+  python3 -m venv .venv && .venv/bin/pip install -r requirements.txt"
 
 # ---- 1. Pré-requisitos ------------------------------------------------------
+"$PY" -c "import PySide6, keyring, pynput" 2>/dev/null || {
+    log "Instalando dependências do venv (requirements.txt)..."
+    "$PY" -m pip install -r requirements.txt
+}
 command -v patchelf >/dev/null 2>&1 || {
     log "Instalando patchelf (precisa de sudo)..."
     sudo apt install -y patchelf
@@ -22,30 +41,69 @@ command -v patchelf >/dev/null 2>&1 || {
 }
 
 # ---- 2. Bundle do pjsua2: binding + libs juntos, rpath portátil -------------
+# Onde o build_pjsip.sh deixa o binding (qualquer um dos dois serve):
+#   - site-packages do venv  (cópia instalada pelo build_pjsip.sh)
+#   - third_party/pjsip-dist (o sip_backend.py já adiciona no sys.path)
 BUNDLE="build/pjsua2_bundle"
-BINDING="_pjsua2.cpython-312-x86_64-linux-gnu.so"
+PJSIP_DIST="third_party/pjsip-dist"
+SITE_DIR="$("$PY" -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')"
+# Sufixo ABI do Python do venv (ex.: .cpython-312-x86_64-linux-gnu.so)
+EXT="$("$PY" -c 'import sysconfig; print(sysconfig.get_config_var("EXT_SUFFIX"))')"
+BINDING_NAME="_pjsua2${EXT}"
 
-log "Preparando $BUNDLE..."
-# Limpa restos de builds antigos (evita misturar libs incompatíveis)
-rm -rf "$BUNDLE"
-mkdir -p "$BUNDLE"
-cp ".venv/lib/python3.12/site-packages/pjsua2.py" "$BUNDLE/"
-cp ".venv/lib/python3.12/site-packages/$BINDING" "$BUNDLE/"
-cp third_party/pjsip-dist/lib/*.so* "$BUNDLE/"
-patchelf --set-rpath '$ORIGIN' "$BUNDLE/$BINDING"
+PJSUA2_PY=""
+PJSUA2_SO=""
+for d in "$SITE_DIR" "$PJSIP_DIST"; do
+    if [ -z "$PJSUA2_PY" ] && [ -f "$d/pjsua2.py" ]; then
+        PJSUA2_PY="$d/pjsua2.py"
+    fi
+    if [ -z "$PJSUA2_SO" ] && [ -f "$d/$BINDING_NAME" ]; then
+        PJSUA2_SO="$d/$BINDING_NAME"
+    fi
+done
+
+HAVE_SIP=0
+if [ -n "$PJSUA2_PY" ] && [ -n "$PJSUA2_SO" ] && compgen -G "$PJSIP_DIST/lib/lib*.so*" >/dev/null; then
+    HAVE_SIP=1
+elif [ "$REQUIRE_SIP" -eq 1 ]; then
+    err "pjsua2 indisponível. Faltando:
+  binding: ${SITE_DIR}/${BINDING_NAME}  ou  ${PJSIP_DIST}/${BINDING_NAME}
+  pjsua2.py e libs: ${PJSIP_DIST}/lib/lib*.so*
+Compile antes com:  ./build_pjsip.sh
+Ou empacote só a UI com:  ./build_exe.sh --no-sip"
+else
+    warn "pjsua2 não encontrado — gerando executável SOMENTE com a UI"
+    warn "(chamadas SIP desativadas). Para SIP completo: ./build_pjsip.sh"
+fi
+
+SIP_ARGS=()
+if [ "$HAVE_SIP" -eq 1 ]; then
+    log "Preparando $BUNDLE..."
+    # Limpa restos de builds antigos (evita misturar libs incompatíveis)
+    rm -rf "$BUNDLE"
+    mkdir -p "$BUNDLE"
+    cp "$PJSUA2_PY" "$BUNDLE/"
+    cp "$PJSUA2_SO" "$BUNDLE/"
+    cp "$PJSIP_DIST"/lib/lib*.so* "$BUNDLE/"
+    patchelf --set-rpath '$ORIGIN' "$BUNDLE/$BINDING_NAME"
+
+    SIP_ARGS=(
+        --paths "$BUNDLE"
+        --add-binary "$BUNDLE/$BINDING_NAME:."
+        --add-binary "$BUNDLE/lib*.so*:."
+        --hidden-import pjsua2
+    )
+fi
 
 # ---- 3. PyInstaller ---------------------------------------------------------
 log "Gerando executável..."
 "$PY" -m PyInstaller --clean --noconfirm \
     --name VoiceNeves \
     softphone.py \
-    --paths "$BUNDLE" \
-    --add-binary "$BUNDLE/$BINDING:." \
-    --add-binary "$BUNDLE/lib*.so*:." \
+    "${SIP_ARGS[@]}" \
     --add-data "ringtone.wav:." \
     --add-data "Icone.png:." \
     --add-data "voiceneves.png:." \
-    --hidden-import pjsua2 \
     --collect-submodules voice_neves \
     --collect-submodules keyring \
     --collect-data keyring \

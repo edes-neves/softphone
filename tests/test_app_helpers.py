@@ -295,6 +295,10 @@ def test_recreate_account_drops_buddy_refs():
     app._drop_presence_buddies = types.MethodType(
         app_module.SoftphoneApp._drop_presence_buddies, app
     )
+    # _build_account_config é chamado antes do modify; o FakeAcc não expõe
+    # modify(), então o _recreate_account cai no caminho de recriação (o que
+    # este teste verifica: soltar as referências dos buddies).
+    app._build_account_config = lambda data, current_server=None: (object(), current_server)
     app_module.SoftphoneApp._recreate_account(app, entry, "pbx.b")
 
     assert entry["acc"].shutdown_called  # shutdown da conta ainda ocorre
@@ -311,6 +315,7 @@ def test_close_event_hides_to_tray_when_active():
 
     self_ = types.SimpleNamespace(
         _tray_icon=_FakeTray(),
+        _quitting=False,
         hide=lambda: got.__setitem__("hide", True),
         show_toast=lambda *a, **k: got.__setitem__("toast", True),
         close=lambda: got.__setitem__("close", True),
@@ -325,12 +330,14 @@ def test_close_event_hides_to_tray_when_active():
     assert got.get("close") is None
 
 
-def test_close_event_closes_when_no_tray():
-    # Sem bandeja, o X deve encerrar o aplicativo (fallback atual).
+def test_close_event_minimizes_when_no_tray():
+    # Sem bandeja, o X deve MINIMIZAR (fallback), não encerrar o app.
     got = {}
     self_ = types.SimpleNamespace(
         _tray_icon=None,
+        _quitting=False,
         hide=lambda: got.__setitem__("hide", True),
+        showMinimized=lambda: got.__setitem__("minimize", True),
         show_toast=lambda *a, **k: got.__setitem__("toast", True),
         close=lambda: got.__setitem__("close", True),
     )
@@ -339,8 +346,56 @@ def test_close_event_closes_when_no_tray():
         accept=lambda: got.__setitem__("accept", True),
     )
     app_module.SoftphoneApp.closeEvent(self_, event)
-    assert got.get("close") is True
+    assert got.get("ignore") is True
+    assert got.get("minimize") is True
+    assert got.get("hide") is None
+    assert got.get("close") is None
+
+
+def test_close_event_quits_when_quitting_flag():
+    # Encerramento explícito (menu Sair) aceita o evento e não minimiza.
+    got = {}
+    self_ = types.SimpleNamespace(
+        _tray_icon=object(),
+        _quitting=True,
+        hide=lambda: got.__setitem__("hide", True),
+        showMinimized=lambda: got.__setitem__("minimize", True),
+    )
+    event = types.SimpleNamespace(
+        ignore=lambda: got.__setitem__("ignore", True),
+        accept=lambda: got.__setitem__("accept", True),
+    )
+    app_module.SoftphoneApp.closeEvent(self_, event)
+    assert got.get("accept") is True
     assert got.get("ignore") is None
+    assert got.get("hide") is None
+    assert got.get("minimize") is None
+
+
+def test_quit_app_closes_window_and_stops_loop(monkeypatch):
+    # BUG: a action "Sair" da bandeja estava ligada a self.close; quando isso
+    # resolvia para o slot C++ QWidget.close(), só emitia closeEvent -- que
+    # ignoramos enquanto o app deve continuar vivo -- e nada acontecia.
+    # _quit_app marca _quitting, faz o teardown (close custom), fecha a janela
+    # de verdade (QMainWindow.close) e para o loop de eventos.
+    got = {}
+    closed = {}
+
+    self_ = types.SimpleNamespace(
+        _quitting=False,
+        close=lambda: got.__setitem__("custom_close", True),
+        qapp=types.SimpleNamespace(quit=lambda: got.__setitem__("quit", True)),
+    )
+    monkeypatch.setattr(
+        app_module.QMainWindow,
+        "close",
+        lambda obj: closed.__setitem__("qt_close", True),
+    )
+    app_module.SoftphoneApp._quit_app(self_)
+    assert self_._quitting is True
+    assert got.get("custom_close") is True   # teardown executado
+    assert closed.get("qt_close") is True    # janela fechada de verdade
+    assert got.get("quit") is True           # loop de eventos encerrado
 
 
 def test_setup_tray_disabled_without_notification_area(monkeypatch):
@@ -355,3 +410,299 @@ def test_setup_tray_disabled_without_notification_area(monkeypatch):
     app_module.SoftphoneApp._setup_tray(self_)
     assert self_._tray_icon is None
     assert self_._tray_menu is None
+
+
+def test_auto_register_accounts_skips_disabled(monkeypatch):
+    # contas com enabled=False não devem ser registradas.
+    registered = []
+    self_ = types.SimpleNamespace(
+        _sip_available=True,
+        accounts=[],
+        config_data={"accounts": [
+            {"user": "100", "server": "pbx", "enabled": True},
+            {"user": "200", "server": "pbx", "enabled": False},
+            {"user": "300", "server": "pbx"},  # ausente -> habilitada
+        ]},
+        refresh=lambda: None,
+        update_presence=lambda: None,
+        _publish_presence=lambda: None,
+        register_account=lambda data: registered.append(data["user"]),
+    )
+    app_module.SoftphoneApp.auto_register_accounts(self_)
+    assert registered == ["100", "300"]
+
+
+def test_toggle_account_enabled(monkeypatch):
+    # botão direito: alterna o flag persistindo em config e re-registra.
+    saved = []
+    toasts = []
+    recheck = []
+    cfg = {"accounts": [{"user": "100", "server": "pbx", "enabled": True}]}
+    self_ = types.SimpleNamespace(
+        call_state="IDLE",
+        config_data=cfg,
+        show_toast=lambda msg: toasts.append(msg),
+        auto_register_accounts=lambda: recheck.append(True),
+        _warn=lambda *a: None,
+        _error=lambda *a: None,
+    )
+    self_._config_account_by_key = types.MethodType(
+        app_module.SoftphoneApp._config_account_by_key, self_
+    )
+    monkeypatch.setattr(app_module, "save_config", lambda data: saved.append(data))
+
+    m = app_module.SoftphoneApp._toggle_account_enabled
+    m(self_, "100@pbx")
+    assert cfg["accounts"][0]["enabled"] is False
+    assert saved and recheck == [True]
+    assert "desabilitada" in toasts[-1]
+
+    m(self_, "100@pbx")
+    assert cfg["accounts"][0]["enabled"] is True
+    assert "habilitada" in toasts[-1]
+
+
+def test_toggle_account_enabled_blocked_during_call(monkeypatch):
+    # durante chamada não altera nada (nem salva).
+    saved = []
+    warned = []
+    cfg = {"accounts": [{"user": "100", "server": "pbx", "enabled": True}]}
+    self_ = types.SimpleNamespace(
+        call_state="IN_CALL",
+        config_data=cfg,
+        _warn=lambda *a: warned.append(a),
+        show_toast=lambda *a: None,
+        auto_register_accounts=lambda: None,
+    )
+    self_._config_account_by_key = types.MethodType(
+        app_module.SoftphoneApp._config_account_by_key, self_
+    )
+    monkeypatch.setattr(app_module, "save_config", lambda data: saved.append(data))
+    app_module.SoftphoneApp._toggle_account_enabled(self_, "100@pbx")
+    assert cfg["accounts"][0]["enabled"] is True
+    assert warned and not saved
+
+
+def test_toggle_account_enabled_missing_account(monkeypatch):
+    # chave inexistente -> erro, sem salvar.
+    saved = []
+    errors = []
+    self_ = types.SimpleNamespace(
+        call_state="IDLE",
+        config_data={"accounts": []},
+        _error=lambda *a: errors.append(a),
+        show_toast=lambda *a: None,
+        auto_register_accounts=lambda: None,
+    )
+    self_._config_account_by_key = types.MethodType(
+        app_module.SoftphoneApp._config_account_by_key, self_
+    )
+    monkeypatch.setattr(app_module, "save_config", lambda data: saved.append(data))
+    app_module.SoftphoneApp._toggle_account_enabled(self_, "999@pbx")
+    assert errors and not saved
+
+
+class _FakeAcc:
+    def __init__(self):
+        self.modified = None
+        self.shutdown_called = False
+        self.registration_renew = None
+
+    def modify(self, cfg):
+        self.modified = cfg
+
+    def setRegistration(self, renew):
+        self.registration_renew = renew
+
+    def shutdown(self):
+        self.shutdown_called = True
+
+
+class _FakeAccountConfig:
+    def __init__(self):
+        self.idUri = ""
+        self.regConfig = types.SimpleNamespace(registrarUri="")
+        self.mwiConfig = types.SimpleNamespace(enabled=False)
+        self.sipConfig = types.SimpleNamespace(authCreds=[])
+
+
+def _rereg_app(entry):
+    app = types.SimpleNamespace(accounts=[entry], _drop_presence_buddies=lambda e: None)
+    app._build_account_config = types.MethodType(
+        app_module.SoftphoneApp._build_account_config, app
+    )
+    app._apply_security_config = lambda cfg: None
+    app._apply_nat_config = lambda cfg: None
+    app._apply_video_config = lambda cfg: None
+    app._apply_media_config = lambda cfg: None
+    app.register_account = lambda data, current_server=None: entry
+    return app
+
+
+def test_reregister_same_identity_uses_modify(monkeypatch):
+    # mesma identidade -> modify() na conta viva (sem shutdown), re-registra
+    # na hora e evita o "Object is busy" do shutdown+create imediato.
+    acc = _FakeAcc()
+    entry = {"acc": acc, "data": {"user": "100", "server": "pbx"},
+             "server_used": "pbx", "status": "ONLINE",
+             "_failover_at": 1.0, "_failover_attempts": 3}
+    monkeypatch.setattr(app_module.pj, "AccountConfig", _FakeAccountConfig, raising=False)
+    monkeypatch.setattr(app_module.pj, "AuthCredInfo",
+                        lambda *a, **k: object(), raising=False)
+    monkeypatch.setattr(app_module, "secrets", types.SimpleNamespace(get=lambda k, d="": ""))
+    app = _rereg_app(entry)
+    new_data = {"user": "100", "server": "pbx", "password": "nova"}
+    out = app_module.SoftphoneApp._reregister_account(app, entry, new_data)
+    assert out is entry
+    assert acc.modified is not None            # modify aplicado (já re-registra)
+    assert acc.shutdown_called is False        # NÃO recriou
+    assert entry["data"] == new_data
+    assert entry["status"] == "REGISTERING"
+    assert entry["_failover_attempts"] == 0
+
+
+def test_reregister_changed_identity_recreates(monkeypatch):
+    # identidade mudou -> shutdown da antiga, remove da lista e recria.
+    acc = _FakeAcc()
+    entry = {"acc": acc, "data": {"user": "100", "server": "pbx"},
+             "server_used": "pbx", "status": "ONLINE"}
+    created = []
+    monkeypatch.setattr(app_module, "secrets", types.SimpleNamespace(get=lambda k, d="": ""))
+    app = _rereg_app(entry)
+    app.register_account = lambda data, current_server=None: created.append(data)
+    new_data = {"user": "200", "server": "pbx"}
+    app_module.SoftphoneApp._reregister_account(app, entry, new_data)
+    assert acc.shutdown_called is True
+    assert entry not in app.accounts            # antiga removida
+    assert created == [new_data]                # nova criada
+
+
+def test_failover_after_sec_defaults_and_clamps():
+    m = app_module.SoftphoneApp._failover_after_sec
+    assert m(types.SimpleNamespace(config_data={})) == 20
+    assert m(types.SimpleNamespace(config_data={"registration": {}})) == 20
+    assert m(types.SimpleNamespace(
+        config_data={"registration": {"failover_after_sec": 7}})) == 7
+    assert m(types.SimpleNamespace(
+        config_data={"registration": {"failover_after_sec": 0}})) == 3
+    assert m(types.SimpleNamespace(
+        config_data={"registration": {"failover_after_sec": 9999}})) == 300
+    assert m(types.SimpleNamespace(
+        config_data={"registration": {"failover_after_sec": "abc"}})) == 20
+
+
+def test_check_failover_fires_after_threshold(monkeypatch):
+    # conta presa em REGISTERING sem ONLINE além do tempo -> dispara failover.
+    import time as _time
+    now = 1000.0
+    entry = {
+        "acc": object(),
+        "data": {"user": "100", "server": "pbx", "backup_server": "pbx2"},
+        "server_used": "pbx", "status": "REGISTERING",
+        "enabled": True, "_reg_started_at": now - 25,  # 25s > 20
+    }
+    app = types.SimpleNamespace(
+        accounts=[entry], _sip_available=True, call_state="IDLE",
+        config_data={"registration": {"failover_after_sec": 20}},
+    )
+    app._failover_after_sec = types.MethodType(
+        app_module.SoftphoneApp._failover_after_sec, app
+    )
+    fired = []
+    app._maybe_failover = lambda e: fired.append(e)
+    monkeypatch.setattr(_time, "time", lambda: now)
+    app_module.SoftphoneApp._check_failover(app)
+    assert fired == [entry]
+
+
+def test_check_failover_skips_no_backup_online_and_threshold(monkeypatch):
+    import time as _time
+    now = 1000.0
+    base = {"acc": object(), "server_used": "pbx", "status": "REGISTERING",
+            "enabled": True, "_reg_started_at": now - 25}
+    no_backup = dict(base, data={"user": "100", "server": "pbx"})
+    online = dict(base, data={"user": "100", "server": "pbx", "backup_server": "pbx2"})
+    online["status"] = "ONLINE"
+    fresh = dict(base, data={"user": "100", "server": "pbx", "backup_server": "pbx2"})
+    fresh["_reg_started_at"] = now - 5  # < 20
+    disabled = dict(fresh, data={"user": "100", "server": "pbx", "backup_server": "pbx2"})
+    disabled["enabled"] = False
+    disabled["_reg_started_at"] = now - 25
+    app = types.SimpleNamespace(
+        accounts=[no_backup, online, fresh, disabled],
+        _sip_available=True, call_state="IDLE",
+        config_data={"registration": {"failover_after_sec": 20}},
+    )
+    app._failover_after_sec = types.MethodType(
+        app_module.SoftphoneApp._failover_after_sec, app
+    )
+    fired = []
+    app._maybe_failover = lambda e: fired.append(e)
+    monkeypatch.setattr(_time, "time", lambda: now)
+    app_module.SoftphoneApp._check_failover(app)
+    assert fired == []
+
+
+def test_check_failover_skips_during_call(monkeypatch):
+    import time as _time
+    now = 1000.0
+    entry = {"acc": object(),
+             "data": {"user": "100", "server": "pbx", "backup_server": "pbx2"},
+             "server_used": "pbx", "status": "REGISTERING",
+             "enabled": True, "_reg_started_at": now - 99}
+    app = types.SimpleNamespace(
+        accounts=[entry], _sip_available=True, call_state="IN_CALL",
+        config_data={"registration": {"failover_after_sec": 20}},
+    )
+    app._failover_after_sec = types.MethodType(
+        app_module.SoftphoneApp._failover_after_sec, app
+    )
+    fired = []
+    app._maybe_failover = lambda e: fired.append(e)
+    monkeypatch.setattr(_time, "time", lambda: now)
+    app_module.SoftphoneApp._check_failover(app)
+    assert fired == []
+
+
+def test_recreate_account_uses_modify(monkeypatch):
+    # Failover na conta viva: modify() troca o servidor SEM shutdown (evita
+    # o "Object is busy" do shutdown+create imediato).
+    acc = _FakeAcc()
+    entry = {"acc": acc, "data": {"user": "100", "server": "pbx",
+                                  "backup_server": "pbx2"},
+             "server_used": "pbx", "status": "OFFLINE"}
+    monkeypatch.setattr(app_module.pj, "AccountConfig", _FakeAccountConfig, raising=False)
+    monkeypatch.setattr(app_module.pj, "AuthCredInfo",
+                        lambda *a, **k: object(), raising=False)
+    monkeypatch.setattr(app_module, "secrets", types.SimpleNamespace(get=lambda k, d="": ""))
+    app = types.SimpleNamespace(
+        accounts=[entry], _drop_presence_buddies=lambda e: None,
+        refresh=lambda: None, update_presence=lambda: None,
+        register_account=lambda data, current_server=None: entry,
+    )
+    app._build_account_config = types.MethodType(
+        app_module.SoftphoneApp._build_account_config, app
+    )
+    app._apply_security_config = lambda cfg: None
+    app._apply_nat_config = lambda cfg: None
+    app._apply_video_config = lambda cfg: None
+    app._apply_media_config = lambda cfg: None
+    app._failover_after_sec = types.MethodType(
+        app_module.SoftphoneApp._failover_after_sec, app
+    )
+    app.config_data = {}
+    old = app.register_account
+    called = {"recreate": False}
+
+    def _reg(data, current_server=None):
+        called["recreate"] = True
+        return old(data, current_server)
+
+    app.register_account = _reg
+    out = app_module.SoftphoneApp._recreate_account(app, entry, "pbx2")
+    assert out is entry
+    assert acc.modified is not None            # modify aplicado
+    assert acc.shutdown_called is False        # NÃO recriou
+    assert entry["server_used"] == "pbx2"      # aponta para o backup
+    assert entry["status"] == "REGISTERING"
+    assert called["recreate"] is False

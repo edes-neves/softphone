@@ -74,7 +74,16 @@ from .utils import (
     clean_extension, is_valid_extension, is_valid_server,
     build_sip_target, format_phone, phone_matches, _as_bool, failover_target,
 )
-from .config import _account_key, _clean_ldap, _clean_keepalive, _clean_dtmf, load_config, save_config, DEFAULT_UPDATER_URL
+from .config import (
+    _account_key,
+    _clean_ldap,
+    _clean_keepalive,
+    _clean_dtmf,
+    _clean_registration,
+    load_config,
+    save_config,
+    DEFAULT_UPDATER_URL,
+)
 from .history import load_history, save_history
 from .contacts_store import ContactsStore
 from .ldap_manager import LDAPManager
@@ -1009,6 +1018,7 @@ class SoftphoneApp(QMainWindow):
 
         self._tray_icon = None
         self._tray_menu = None
+        self._quitting = False
         self._hotkeys = None
         self._theme_proc = None
 
@@ -1083,6 +1093,12 @@ class SoftphoneApp(QMainWindow):
         self._loop_timer.timeout.connect(self.loop)
         self._loop_timer.start(50)
 
+        # Watchdog do failover: força a troca para o servidor de backup quando
+        # uma conta fica sem registro além do tempo configurado pelo usuário.
+        self._failover_timer = QTimer(self)
+        self._failover_timer.timeout.connect(self._check_failover)
+        self._failover_timer.start(2000)
+
         QTimer.singleShot(50, self.loop)
         if getattr(self, "_audio_warning", None):
             QTimer.singleShot(1200, self._show_audio_warning)
@@ -1143,7 +1159,7 @@ class SoftphoneApp(QMainWindow):
         m_arquivo.addSeparator()
         a_sair = QAction("Sair", self)
         a_sair.setShortcut(QKeySequence("Ctrl+Q"))
-        a_sair.triggered.connect(self.close)
+        a_sair.triggered.connect(self._quit_app)
         m_arquivo.addAction(a_sair)
 
         m_editar = bar.addMenu("Editar")
@@ -1346,6 +1362,8 @@ class SoftphoneApp(QMainWindow):
         self.listbox.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.listbox.setMinimumHeight(90)
         self.listbox.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Ignored)
+        self.listbox.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.listbox.customContextMenuRequested.connect(self._show_accounts_context_menu)
         acc_v.addWidget(self.listbox)
 
         # --- Discagem ---
@@ -1907,11 +1925,72 @@ class SoftphoneApp(QMainWindow):
         idx = self.listbox.currentRow()
         return idx if idx >= 0 else None
 
+    def selected_key(self):
+        """Chave user@server do item de conta selecionado (ignora itens de
+        telefone, que não carregam chave em UserRole)."""
+        item = self.listbox.currentItem()
+        if item is None:
+            return None
+        key = item.data(Qt.ItemDataRole.UserRole)
+        return key or None
+
     def selected_account(self):
+        key = self.selected_key()
+        if key:
+            return self._entry_by_key(key)
         idx = self._selected_account_index()
         if idx is not None and idx < len(self.accounts):
             return self.accounts[idx]
         return None
+
+    def _show_accounts_context_menu(self, pos):
+        item = self.listbox.itemAt(pos)
+        if item is None:
+            return
+        key = item.data(Qt.ItemDataRole.UserRole)
+        if not key:
+            return
+        acc_cfg = self._config_account_by_key(key)
+        if acc_cfg is None:
+            return
+        enabled = acc_cfg.get("enabled", True)
+        menu = QMenu(self)
+        if enabled:
+            act = menu.addAction("Desabilitar conta")
+        else:
+            act = menu.addAction("Habilitar conta")
+        act_edit = menu.addAction("Editar conta")
+        act_del = menu.addAction("Deletar conta")
+        chosen = menu.exec(self.listbox.viewport().mapToGlobal(pos))
+        if chosen is act:
+            self._toggle_account_enabled(key)
+        elif chosen is act_edit:
+            entry = self._entry_by_key(key)
+            if entry is not None:
+                self.edit_account(entry)
+        elif chosen is act_del:
+            entry = self._entry_by_key(key)
+            if entry is not None:
+                self.delete_account(entry)
+
+    def _toggle_account_enabled(self, key):
+        if self.call_state != "IDLE":
+            self._warn("Chamada em andamento", "Encerre a chamada atual antes de alterar uma conta.")
+            return
+        acc_cfg = self._config_account_by_key(key)
+        if acc_cfg is None:
+            self._error("Erro", "Conta não encontrada.")
+            return
+        new_state = not acc_cfg.get("enabled", True)
+        acc_cfg["enabled"] = new_state
+        save_config(self.config_data)
+        if new_state:
+            self.show_toast(f"Conta {key} habilitada")
+        else:
+            self.show_toast(f"Conta {key} desabilitada")
+        # auto_register_accounts desliga as atuais e re-registra apenas as
+        # habilitadas, então basta reexecutar para aplicar o novo estado.
+        self.auto_register_accounts()
 
     def _config_account_by_key(self, key):
         user, _, server = key.partition("@")
@@ -1926,7 +2005,8 @@ class SoftphoneApp(QMainWindow):
         acc_cfg = self._config_account_by_key(key)
         if acc_cfg is None:
             return None
-        return {"data": dict(acc_cfg), "status": "OFFLINE"}
+        return {"data": dict(acc_cfg), "status": "OFFLINE",
+                "enabled": acc_cfg.get("enabled", True)}
 
     def _reload_accounts_combo(self):
         combo = getattr(self, "combo_accounts", None)
@@ -2092,26 +2172,33 @@ class SoftphoneApp(QMainWindow):
             if _account_key(acc_cfg) == old_key:
                 self.config_data["accounts"][i] = {
                     "user": user, "server": server, "backup_server": backup_server,
-                    "phone": phone, **forward_data,
+                    "phone": phone, "enabled": acc_cfg.get("enabled", True),
+                    **forward_data,
                 }
                 break
 
         save_config(self.config_data)
-        acc_old = entry.get("acc")
-        if acc_old is not None:
-            try:
-                acc_old.shutdown()
-            except Exception as e:
-                logging.warning("Erro ao remover conta antiga do pjsip: %s", e)
-        if entry in self.accounts:
-            self.accounts.remove(entry)
+
+        # Reconecta a conta editada na hora, sem reiniciar o app. Não usamos
+        # auto_register_accounts() aqui porque ele derruba TODAS as contas e
+        # as recria imediatamente: recriar a mesma URI logo após o shutdown
+        # falha com "Object is busy (PJSIP_EBUSY)" e o REGISTER não saía.
+        was_live = entry in self.accounts
+        new_cfg = self._config_account_by_key(new_key)
+        if was_live and new_cfg is not None:
+            self._reregister_account(entry, new_cfg)
+        elif new_cfg is not None and new_cfg.get("enabled", True):
+            # Conta desabilitada/editada fora da lista viva: só cria se agora
+            # estiver habilitada.
+            self.register_account(new_cfg)
 
         if self.edit_win is not None:
             self.edit_win.close()
         self.edit_win = None
         self._edit_entry = None
         self._reload_accounts_combo()
-        self.auto_register_accounts()
+        self.refresh()
+        self.update_presence()
 
     def delete_account(self, entry=None):
         if self.call_state != "IDLE":
@@ -2173,33 +2260,57 @@ class SoftphoneApp(QMainWindow):
             "ONLINE": (COLOR_SUCCESS, "●", "ONLINE"),
             "REGISTERING": (COLOR_WARNING, "◐", "REGISTRANDO"),
             "OFFLINE": (COLOR_DANGER, "○", "OFFLINE"),
+            "DISABLED": (COLOR_MUTED, "⏸", "DESABILITADA"),
         }
+        # Ordem de exibição = ordem da config; conta habilitada tem entry em
+        # runtime (self.accounts), desabilitada só existe na config.
+        runtime_by_key = {}
+        for entry in self.accounts:
+            data = entry.get("data") or {}
+            runtime_by_key[f"{data.get('user')}@{data.get('server')}"] = entry
         target_row = None
-        for i, entry in enumerate(self.accounts):
-            status = entry["status"]
+        for acc_cfg in self.config_data.get("accounts", []):
+            key = f"{acc_cfg['user']}@{acc_cfg['server']}"
+            entry = runtime_by_key.get(key)
+            if entry is not None:
+                status = entry["status"]
+                data = entry.get("data") or {}
+                server_used = entry.get("server_used")
+                mwi = self._mwi.get(id(entry))
+            else:
+                status = "OFFLINE" if acc_cfg.get("enabled", True) else "DISABLED"
+                data = acc_cfg
+                server_used = None
+                mwi = None
             color, icon, label = status_cfg.get(status, (COLOR_MUTED, "○", status))
             suffix = ""
-            mwi = self._mwi.get(id(entry))
             if mwi:
                 suffix += f"  📩 {int(mwi)}"
-            used = entry.get("server_used")
-            primary = (entry.get("data") or {}).get("server", "")
+            used = server_used
+            primary = data.get("server", "")
             if used and primary and used != primary:
                 suffix += f"  ({used})"
             row = self.listbox.count()
-            if keep_key == f"{entry['data']['user']}@{entry['data']['server']}":
+            if keep_key == key:
                 target_row = row
-            item = QListWidgetItem(f"{icon}  {entry['data']['user']}  ({label}){suffix}")
+            item = QListWidgetItem(f"{icon}  {data.get('user')}  ({label}){suffix}")
             item.setForeground(QColor(color))
+            item.setData(Qt.ItemDataRole.UserRole, key)
+            item.setToolTip("Habilitada — botão direito para desabilitar"
+                            if status != "DISABLED" else
+                            "Desabilitada — botão direito para habilitar")
             self.listbox.addItem(item)
-            phone = (entry.get("data") or {}).get("phone", "")
+            phone = data.get("phone", "")
             if phone:
                 phone_item = QListWidgetItem(f"      {phone}")
                 phone_item.setForeground(QColor(COLOR_SUCCESS))
                 phone_item.setToolTip("Telefone")
+                phone_item.setData(Qt.ItemDataRole.UserRole, None)
                 self.listbox.addItem(phone_item)
         if target_row is not None and 0 <= target_row < self.listbox.count():
             self.listbox.setCurrentRow(target_row)
+        elif self.listbox.count():
+            self.listbox.setCurrentRow(0)
 
     def _active_caller_display(self):
         call = self.current_call
@@ -2345,6 +2456,8 @@ class SoftphoneApp(QMainWindow):
                 pass
         self.accounts = []
         for data in self.config_data["accounts"]:
+            if not data.get("enabled", True):
+                continue
             try:
                 self.register_account(data)
             except Exception as e:
@@ -2358,7 +2471,9 @@ class SoftphoneApp(QMainWindow):
     # enxurrada de re-registros quando ambos os servidores recusam a senha.
     FAILOVER_MAX_COOLDOWN = 600
 
-    def register_account(self, data, current_server=None):
+    def _build_account_config(self, data, current_server=None):
+        """Monta o AccountConfig completo de uma conta (mídia, NAT, segurança,
+        credenciais e MWI). Compartilhado por register_account e _reregister."""
         user = data["user"]
         server = data.get("server") or ""
         active = str(current_server or server)
@@ -2366,6 +2481,18 @@ class SoftphoneApp(QMainWindow):
         acfg = pj.AccountConfig()
         acfg.idUri = f"sip:{user}@{server}"
         acfg.regConfig.registrarUri = f"sip:{active}"
+
+        # Timeout de registro configurável (Configurações > Registro): define
+        # quanto o PJSIP espera pela resposta antes de considerar o registro
+        # falho. Menor = falha do primário é detectada antes e o failover para
+        # o backup acontece mais rápido. Também alimenta o watchdog _check_failover.
+        try:
+            reg_timeout = self._failover_after_sec()
+            acfg.regConfig.timeoutSec = reg_timeout
+            acfg.regConfig.firstRetryIntervalSec = min(reg_timeout, 30)
+            acfg.regConfig.retryIntervalSec = min(max(reg_timeout, 30), 300)
+        except Exception as e:
+            logging.warning("Não foi possível configurar timeout de registro: %s", e)
 
         self._apply_security_config(acfg)
         self._apply_nat_config(acfg)
@@ -2380,6 +2507,10 @@ class SoftphoneApp(QMainWindow):
         password = secrets.get(f"{user}@{server}", "")
         cred = pj.AuthCredInfo("digest", "*", user, 0, password)
         acfg.sipConfig.authCreds.append(cred)
+        return acfg, active
+
+    def register_account(self, data, current_server=None):
+        acfg, active = self._build_account_config(data, current_server)
 
         acc = MyAccount(self, data)
         acc.create(acfg)
@@ -2389,11 +2520,57 @@ class SoftphoneApp(QMainWindow):
         entry = {
             "acc": acc, "data": dict(data), "server_used": active,
             "status": "REGISTERING", "buddies": [], "_failover_at": 0.0,
-            "_failover_attempts": 0,
+            "_failover_attempts": 0, "_reg_started_at": time.time(),
+            "enabled": data.get("enabled", True),
         }
         self.accounts.append(entry)
         self._create_presence_buddies(entry)
         return entry
+
+    def _reregister_account(self, entry, data):
+        """Aplica alterações numa conta já existente SEM reiniciar o app.
+
+        Se a identidade (idUri/registrarUri = user@server) não mudou, usa
+        `acc.modify(cfg)`, que reconfigura e re-registra a conta viva na hora
+        — evitando o `shutdown()` + recriação imediata que dispara
+        "Object is busy (PJSIP_EBUSY)" e deixa o REGISTER sem ser enviado.
+        Se a identidade mudou, destrói a antiga e cria a nova (URI diferente
+        não colide)."""
+        user = data["user"]
+        server = data.get("server") or ""
+        acc = entry.get("acc")
+        old_ident = f"{entry['data'].get('user')}@{entry['data'].get('server')}"
+        new_ident = f"{user}@{server}"
+
+        if acc is not None and old_ident == new_ident:
+            acfg, active = self._build_account_config(data)
+            try:
+                acc.modify(acfg)
+            except Exception as e:
+                logging.error("Falha ao modificar conta %s: %s", new_ident, pj_error_text(e))
+                return entry
+            entry["data"] = dict(data)
+            entry["server_used"] = active
+            entry["status"] = "REGISTERING"
+            entry["_failover_at"] = 0.0
+            entry["_failover_attempts"] = 0
+            entry["_reg_started_at"] = time.time()
+            # O próprio modify() já dispara o unregister+reregister da conta
+            # viva (onRegState volta a ser chamado e a conta fica ONLINE sem
+            # reiniciar o app). Não chamar setRegistration() aqui: ele colide
+            # com o registro em curso e falha com "Object is busy".
+            return entry
+
+        # Identidade mudou: recria a conta (URI nova, sem colisão).
+        if acc is not None:
+            self._drop_presence_buddies(entry)
+            try:
+                acc.shutdown()
+            except Exception as e:
+                logging.warning("Erro ao remover conta antiga do pjsip: %s", e)
+            if entry in self.accounts:
+                self.accounts.remove(entry)
+        return self.register_account(data)
 
     def _entry_for_account(self, acc):
         for entry in self.accounts:
@@ -2401,9 +2578,48 @@ class SoftphoneApp(QMainWindow):
                 return entry
         return None
 
+    def _failover_after_sec(self):
+        """Tempo (s) configurado pelo usuário para tentar o servidor de backup.
+
+        Definido em Configurações > Registro. Padrão 20 s, faixa 3–300 s."""
+        reg = self.config_data.get("registration") or {}
+        try:
+            return max(3, min(300, int(reg.get("failover_after_sec", 20))))
+        except (TypeError, ValueError):
+            return 20
+
     def _on_account_reg_failed(self, acc):
         entry = self._entry_for_account(acc)
         if entry is not None:
+            self._maybe_failover(entry)
+
+    def _check_failover(self):
+        """Watchdog: dispara o failover de contas presas sem registro.
+
+        O PJSIP só reporta a falha do primário no timeout da transação SIP
+        (~30 s). Enquanto isso a conta fica "REGISTERING" e o usuário acha que
+        o backup nunca é tentado. Este watchdog, rodado periodicamente, força
+        o failover quando a conta fica sem ONLINE além de failover_after_sec."""
+        if not getattr(self, "_sip_available", False):
+            return
+        if self.call_state != "IDLE":
+            return
+        now = time.time()
+        threshold = self._failover_after_sec()
+        for entry in list(self.accounts):
+            if not entry.get("enabled", True):
+                continue
+            if entry.get("status") == "ONLINE":
+                continue
+            data = entry.get("data") or {}
+            if not str(data.get("backup_server") or "").strip():
+                continue
+            started = entry.get("_reg_started_at")
+            if started is None:
+                entry["_reg_started_at"] = now
+                continue
+            if now - started < threshold:
+                continue
             self._maybe_failover(entry)
 
     def _maybe_failover(self, entry):
@@ -2435,6 +2651,34 @@ class SoftphoneApp(QMainWindow):
         self.show_toast(f"Servidor indisponível; tentando backup {target}")
 
     def _recreate_account(self, entry, target):
+        """Troca o servidor de registro da conta viva (failover primário↔backup).
+
+        Antes esta função fazia `shutdown()` + `register_account()` imediatos,
+        que dispara "Object is busy (PJSIP_EBUSY)" no REGISTER da conta antiga
+        ainda pendente e às vezes deixava a nova conta sem registrar. Aqui
+        usamos `modify()` (mesma conta, sem shutdown): ele reconfigura o
+        `registrarUri` para o alvo e re-registra na hora. Só recriamos a conta
+        se o modify falhar."""
+        data = entry.get("data") or {}
+        acc = entry.get("acc")
+        if acc is not None:
+            acfg, _ = self._build_account_config(data, current_server=target)
+            try:
+                acc.modify(acfg)
+            except Exception as e:
+                logging.warning(
+                    "Failover via modify() falhou em %s (%s); recriando conta",
+                    data.get("server") or "", pj_error_text(e),
+                )
+            else:
+                entry["server_used"] = target
+                entry["status"] = "REGISTERING"
+                entry["_reg_started_at"] = time.time()
+                self.refresh()
+                self.update_presence()
+                return entry
+
+        # Fallback: modify indisponível -> recria a conta (comportamento antigo).
         try:
             idx = self.accounts.index(entry)
         except ValueError:
@@ -2445,7 +2689,7 @@ class SoftphoneApp(QMainWindow):
         except Exception as e:
             logging.warning("Erro ao remover conta no failover: %s", e)
         self._drop_presence_buddies(entry)
-        new_entry = self.register_account(entry["data"], current_server=target)
+        new_entry = self.register_account(data, current_server=target)
         # Preserva o cooldown do failover na conta recriada: sem isso, cada
         # falha de autenticação com backup configurado recriava a conta em
         # loop infinito (nova entry sempre nascia com _failover_at = 0.0).
@@ -2458,6 +2702,7 @@ class SoftphoneApp(QMainWindow):
             self.accounts.insert(min(idx, len(self.accounts)), moved)
         self.refresh()
         self.update_presence()
+        return new_entry
 
     def _on_mwi_info(self, acc, count):
         entry = self._entry_for_account(acc)
@@ -2687,6 +2932,10 @@ class SoftphoneApp(QMainWindow):
                     # online: backoff só existe durante falhas consecutivas.
                     entry["_failover_at"] = 0.0
                     entry["_failover_attempts"] = 0
+                    entry["_reg_started_at"] = None
+                elif status == "REGISTERING" and entry.get("_reg_started_at") is None:
+                    # volta a contar o tempo sem registro (watchdog de failover)
+                    entry["_reg_started_at"] = time.time()
                 break
         self.refresh()
         self.update_presence()
@@ -2724,7 +2973,8 @@ class SoftphoneApp(QMainWindow):
             secrets.set(key, password)
         if existing is None:
             self.config_data["accounts"].append(
-                {"user": user, "server": server, "backup_server": backup_server, "phone": phone}
+                {"user": user, "server": server, "backup_server": backup_server,
+                 "phone": phone, "enabled": True}
             )
             save_config(self.config_data)
         for w in (self.user, self.server, self.password, self.backup_server, self.phone):
@@ -4272,6 +4522,7 @@ class SoftphoneApp(QMainWindow):
         tab_audio = self._make_scroll_tab(nb, "Áudio")
         tab_recursos = self._make_scroll_tab(nb, "Recursos")
         tab_keepalive = self._make_scroll_tab(nb, "Keep-Alive")
+        tab_registro = self._make_scroll_tab(nb, "Registro")
         tab_dtmf = self._make_scroll_tab(nb, "DTMF")
         tab_ldap = self._make_scroll_tab(nb, "LDAP")
         tab_aparencia = self._make_scroll_tab(nb, "Aparência")
@@ -4421,6 +4672,30 @@ class SoftphoneApp(QMainWindow):
         btn_ka = RoundedButton(self, "💾  Salvar Keep-Alive", self._save_keepalive_settings,
                                COLOR_SUCCESS, fg="#FFFFFF", pady=6)
         kal.addRow(btn_ka)
+
+        # ---- Registro (failover de servidor) ----
+        reg_frame = QGroupBox("Servidor de backup (failover)")
+        tab_registro.layout().addWidget(reg_frame)
+        rl = QFormLayout(reg_frame)
+        reg_cfg = self.config_data.get("registration") or {}
+        self.reg_failover_spin = QSpinBox()
+        self.reg_failover_spin.setRange(3, 300)
+        self.reg_failover_spin.setValue(int(reg_cfg.get("failover_after_sec", 20)))
+        self.reg_failover_spin.setSuffix(" s")
+        rl.addRow("Tentar o backup após", self.reg_failover_spin)
+        reg_hint = QLabel(
+            "Tempo que o app espera com a conta sem registro antes de tentar o "
+            "servidor de backup configurado na conta. Esse valor também é usado "
+            "como timeout do registro no PJSIP: quanto menor, mais rápido o "
+            "backup é tentado quando o servidor primário está fora do ar. "
+            "Contas sem servidor de backup não são afetadas."
+        )
+        reg_hint.setWordWrap(True)
+        reg_hint.setStyleSheet(f"color:{COLOR_TEXT};")
+        rl.addRow(reg_hint)
+        btn_reg = RoundedButton(self, "💾  Salvar Registro", self._save_registration_settings,
+                                COLOR_SUCCESS, fg="#FFFFFF", pady=6)
+        rl.addRow(btn_reg)
 
         # ---- DTMF ----
         dtmf_frame = QGroupBox("DTMF (teclas do teclado durante chamadas)")
@@ -4619,6 +4894,32 @@ class SoftphoneApp(QMainWindow):
         else:
             self._info("Keep-Alive",
                        "Configuração de keep-alive salva.\n\n"
+                       "Como há chamada em andamento, o novo valor será aplicado "
+                       "na próxima vez em que as contas forem registradas "
+                       "(ou ao reiniciar o app).",
+                       self.settings_win)
+
+    def _save_registration_settings(self):
+        if self.settings_win is None:
+            return
+        try:
+            failover_after = max(3, min(300, int(self.reg_failover_spin.value())))
+        except (TypeError, ValueError):
+            failover_after = 20
+        self.config_data["registration"] = _clean_registration(
+            {"failover_after_sec": failover_after}
+        )
+        save_config(self.config_data)
+        # Aplica imediatamente re-registrando as contas (sem chamada em curso):
+        # o novo timeout entra no AccountConfig e o watchdog passa a usá-lo.
+        if self._sip_available and self.call_state == "IDLE":
+            self.auto_register_accounts()
+            self._info("Registro",
+                       "Tempo de failover salvo e aplicado às contas.",
+                       self.settings_win)
+        else:
+            self._info("Registro",
+                       "Tempo de failover salvo.\n\n"
                        "Como há chamada em andamento, o novo valor será aplicado "
                        "na próxima vez em que as contas forem registradas "
                        "(ou ao reiniciar o app).",
@@ -6489,7 +6790,7 @@ class SoftphoneApp(QMainWindow):
             menu.addSeparator()
             menu.addAction("Abrir", self._show_window)
             menu.addSeparator()
-            menu.addAction("Sair", self.close)
+            menu.addAction("Sair", self._quit_app)
             self._tray_menu = menu
             self._tray_icon = QSystemTrayIcon(icon, self)
             self._tray_icon.setContextMenu(menu)
@@ -6511,6 +6812,27 @@ class SoftphoneApp(QMainWindow):
                 self._show_window()
         except Exception as e:
             logging.warning("Falha ao tratar clique na bandeja: %s", e)
+
+    def _quit_app(self):
+        # Encerramento explícito (menu da bandeja, Arquivo > Sair, Ctrl+Q).
+        # Marca _quitting ANTES de fechar para que closeEvent aceite o
+        # fechamento, roda o teardown (pjsua2, threads, bandeja) e para o loop.
+        # Conectar a action da bandeja a este método (em vez de self.close)
+        # evita que ela caia no slot C++ QWidget.close(), que apenas emitiria
+        # closeEvent -- que ignoramos enquanto o app deve continuar vivo.
+        self._quitting = True
+        try:
+            self.close()
+        except Exception as e:
+            logging.error("Erro ao encerrar pelo menu: %s", e)
+        try:
+            QMainWindow.close(self)
+        except Exception:
+            pass
+        try:
+            self.qapp.quit()
+        except Exception:
+            pass
 
     def _on_minimize(self):
         try:
@@ -6612,6 +6934,7 @@ class SoftphoneApp(QMainWindow):
             logging.error("Erro no loop pjsip: %s", e)
 
     def close(self):
+        self._quitting = True
         try:
             self._answer_blink_on = False
             if getattr(self, "_theme_proc", None) is not None:
@@ -6699,13 +7022,26 @@ class SoftphoneApp(QMainWindow):
             pass
 
     def closeEvent(self, event):
+        # Encerramento explícito (menu Arquivo > Sair, Ctrl+Q, failover de
+        # desligamento) passa por aqui apenas quando pedimos de verdade; nesse
+        # caso fechamos. O botão X da janela NÃO encerra o app: minimiza para a
+        # bandeja (se houver) ou para a barra de tarefas (fallback sem bandeja),
+        # mantendo o softphone ativo para receber chamadas.
+        if getattr(self, "_quitting", False):
+            event.accept()
+            return
         if getattr(self, "_tray_icon", None) is not None:
             event.ignore()
             self.hide()
             self.show_toast("Voice Neves continua ativo na bandeja do sistema.")
         else:
-            self.close()
-            event.accept()
+            # Sem bandeja disponível (ex.: X11 sem suporte a system tray):
+            # minimiza para a barra de tarefas em vez de encerrar.
+            event.ignore()
+            self.showMinimized()
+            self.show_toast(
+                "Voice Neves continua ativo. Use Arquivo > Sair para encerrar."
+            )
 
     # =========================
     # PROVISIONING / UPDATER / CTI
@@ -6777,13 +7113,19 @@ class SoftphoneApp(QMainWindow):
     def _apply_fetched_provision(self, payload):
         accounts = payload.get("accounts")
         if isinstance(accounts, list):
+            prev_enabled = {_account_key(a): a.get("enabled", True)
+                            for a in self.config_data.get("accounts", [])}
             desired = {(a["user"], a["server"]): a for a in accounts}
             self.config_data["accounts"] = []
             for key in desired:
                 acc = desired[key]
-                self.config_data["accounts"].append({"user": acc["user"], "server": acc["server"]})
+                ident = f"{acc['user']}@{acc['server']}"
+                self.config_data["accounts"].append({
+                    "user": acc["user"], "server": acc["server"],
+                    "enabled": prev_enabled.get(ident, True),
+                })
                 if acc.get("password"):
-                    secrets.set(f"{acc['user']}@{acc['server']}", acc["password"])
+                    secrets.set(ident, acc["password"])
         for key in ("security", "nat"):
             if key in payload and isinstance(payload[key], dict):
                 self.config_data[key] = payload[key]

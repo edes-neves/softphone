@@ -62,6 +62,7 @@ def _normalize_accounts(accounts, secrets):
                 "server": server,
                 "phone": str(item.get("phone") or "").strip(),
                 "backup_server": backup_server,
+                "enabled": bool(item.get("enabled", True)),
                 "forward_unconditional": str(item.get("forward_unconditional") or "").strip(),
                 "forward_busy": str(item.get("forward_busy") or "").strip(),
                 "forward_no_answer": str(item.get("forward_no_answer") or "").strip(),
@@ -239,6 +240,25 @@ def _clean_keepalive(raw):
     }
 
 
+def _clean_registration(raw):
+    """Normaliza a seção de registro SIP (timeouts e failover de servidor).
+
+    ``failover_after_sec`` é o tempo, em segundos, que o app espera com uma
+    conta sem registro antes de tentar o servidor de backup. Também é aplicado
+    como timeout do registro no PJSIP (``regConfig.timeoutSec``), para a falha
+    do servidor primário ser detectada mais rápido do que o padrão (~30 s).
+    """
+    if not isinstance(raw, dict):
+        raw = {}
+    try:
+        failover_after = int(raw.get("failover_after_sec", 20))
+    except (TypeError, ValueError):
+        failover_after = 20
+    return {
+        "failover_after_sec": max(3, min(300, failover_after)),
+    }
+
+
 def _clean_dtmf(raw):
     """Normaliza a seção de DTMF (método e duração do tom) da configuração.
 
@@ -312,6 +332,7 @@ def _default_config(secrets):
         "cti": _clean_cti(None),
         "keepalive": _clean_keepalive(None),
         "dtmf": _clean_dtmf(None),
+        "registration": _clean_registration(None),
     }
 
 
@@ -411,6 +432,7 @@ def load_config(secrets):
             "cti": _clean_cti(data.get("cti")),
             "keepalive": _clean_keepalive(data.get("keepalive")),
             "dtmf": _clean_dtmf(data.get("dtmf")),
+            "registration": _clean_registration(data.get("registration")),
         }
     except Exception as e:
         logging.error("Erro ao ler config (%s); usando configuração vazia", e)

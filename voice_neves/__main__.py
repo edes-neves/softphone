@@ -45,6 +45,7 @@ def main():
     os.environ.setdefault("NO_AT_BRIDGE", "1")
     # Import tardio: so agora o runtime (SecretsStore) e a UI (pjsua2) sao
     # carregados, com o logging ja configurado.
+    from PySide6.QtNetwork import QLocalServer, QLocalSocket
     from PySide6.QtWidgets import QApplication
 
     from .app import SoftphoneApp
@@ -52,7 +53,40 @@ def main():
     qapp = QApplication(sys.argv)
     qapp.setApplicationName("VoiceNeves")
     qapp.setApplicationDisplayName("Voice Neves")
+
+    # ---- Instancia unica ----
+    # Se o app ja estiver rodando (mesmo minimizado na bandeja), a nova
+    # execucao NAO abre outra instancia: apenas pede a janela existente para
+    # reaparecer (maximizar/restaurar) e sai. Evita varios icones/processos.
+    server_name = "VoiceNeves-single-instance"
+    probe = QLocalSocket()
+    probe.connectToServer(server_name)
+    if probe.waitForConnected(300):
+        probe.write(b"show")
+        probe.flush()
+        probe.waitForBytesWritten(300)
+        probe.disconnectFromServer()
+        os._exit(0)
+
+    # Nenhuma instancia ativa: se sobrou um socket orfao (ex.: crash anterior),
+    # remove para poder escutar.
+    QLocalServer.removeServer(server_name)
+    server = QLocalServer()
+    if not server.listen(server_name):
+        logging.warning("Nao foi possivel criar o servidor de instancia unica: %s",
+                        server.errorString())
+
     app = SoftphoneApp(qapp)
+
+    def _on_second_instance():
+        while server.hasPendingConnections():
+            conn = server.nextPendingConnection()
+            conn.readyRead.connect(lambda c=conn: c.readAll())
+            conn.disconnected.connect(conn.deleteLater)
+        app._show_window()
+
+    server.newConnection.connect(_on_second_instance)
+
     app.show()
     rc = qapp.exec()
     # Threads de audio/pjsua podem manter o interpretador vivo apos o

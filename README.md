@@ -46,6 +46,33 @@ secrets_store, contacts_store, platform, sip_backend) e pulam
 camada pura e pytest; há job extra para Windows e macOS validando que o app
 carrega (sem pjsua2) e os testes da camada pura passam.
 
+### Teste de integração (SIP) da reconexão e failover de conta
+
+O teste `tests/test_account_reregister_integration.py` sobe um mini-servidor SIP
+UDP local e exercita métodos reais do app para provar que: editar uma conta a
+reconecta na hora e que, quando o servidor primário não registra, o app troca
+para o servidor de backup **sem reiniciar**. Ele é **pulado por padrão**
+(mantém o `pytest` offline e rápido); rode explicitamente:
+
+```bash
+SIP_INTEGRATION_TEST=1 python -m pytest tests/test_account_reregister_integration.py -v
+```
+
+Ele também é pulado automaticamente se o `pjsua2` não estiver instalado.
+
+## Failover de servidor e bandeja
+
+- **Servidor de backup (failover):** cada conta pode ter um servidor de backup
+  (campo na criação/edição da conta). Em **Configurações → Registro** o usuário
+  define em quantos segundos o app deve tentar o backup quando a conta fica sem
+  registro (padrão 20 s, faixa 3–300 s). Esse valor também é usado como timeout
+  de registro no PJSIP, para a falha do primário ser detectada rápido. Sem
+  servidor de backup configurado, nada muda.
+- **Bandeja do sistema:** o botão X da janela **não encerra** o app — ele
+  minimiza para a bandeja (se disponível) ou para a barra de tarefas (fallback
+  quando o ambiente não tem system tray). Use **Arquivo → Sair** (Ctrl+Q) para
+  encerrar de vez.
+
 ## Suporte multi-plataforma (cross-platform)
 
 O app é **multi-plataforma na camada de UI e lógica pura**:
@@ -88,26 +115,26 @@ locais não-pt-BR.
 
 ## Dependências
 
-- **Python 3.14+** (com Tkinter)
-- **PJSIP/pjsua2 2.14** — não é distribuído via pip. Compile o PJSIP ou instale
-  o pacote pré-compilado no site-packages do sistema (ex.: egg do pjsua2).
-
-  O `softphone.py` importa `pjsua2` direto do ambiente. Se usar um `venv`, aponte
-   o `pathex` do spec para o diretório do egg (veja `VoiceNeves.spec`).
+- **Python 3.11+** — o projeto usa o `.venv` do próprio diretório (hoje 3.12).
+- **PJSIP/pjsua2 2.14** — não é distribuído via pip. Compile com
+  `./build_pjsip.sh`, que instala o binding no `.venv` **e** em
+  `third_party/pjsip-dist/` (de onde `voice_neves/sip_backend.py` também o
+  importa). As libs `libpj*` ficam em `third_party/pjsip-dist/lib/`.
 
 - **keyring** (opcional, recomendado) — armazena as senhas no cofre do sistema
   (Secret Service/KWallet). Sem keyring, o app cai para um arquivo `secrets.json`
   local com permissão `0600`.
 
 ```bash
-python3 -m venv venv
-venv/bin/pip install -r requirements.txt   # pyinstaller + keyring
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt   # PySide6 + pyinstaller + keyring + pynput
+./build_pjsip.sh                            # compila o pjsua2 para este .venv
 ```
 
 ## Executar (desenvolvimento)
 
 ```bash
-python3 softphone.py
+.venv/bin/python softphone.py
 ```
 
 ## Configuração
@@ -132,12 +159,21 @@ original.
 
 ## Gerar o binário (PyInstaller)
 
-O spec espera o egg do pjsua2 em `/usr/local/lib/python3.14/dist-packages/pjsua2-2.14-*.egg`
-e o libpjsua2 em `/usr/local/lib`. Ajuste `PJSUA2_EGG` e `PJSUA2_LIB` no
-`VoiceNeves.spec` se o caminho diferir na sua máquina.
+```bash
+./build_exe.sh            # exe + AppImage (requer ./build_pjsip.sh antes)
+./build_exe.sh --no-sip   # só a UI, sem pjsua2 (chamadas SIP desativadas)
+```
+
+O `build_exe.sh` monta o bundle do pjsua2 a partir de `third_party/pjsip-dist/`
+(binding + `lib/lib*.so*`), ajusta o `rpath` para `$ORIGIN` e chama o
+PyInstaller e o `appimagetool`.
+
+Alternativa manual (spec): o `VoiceNeves.spec` lê o binding de
+`build/pjsua2_bundle/` — monte esse diretório antes (é o que o `build_exe.sh`
+faz) e rode:
 
 ```bash
-venv/bin/pyinstaller VoiceNeves.spec --noconfirm --clean
+.venv/bin/pyinstaller VoiceNeves.spec --noconfirm --clean
 ```
 
 O executável é gerado em `dist/VoiceNeves/VoiceNeves`.
@@ -376,26 +412,23 @@ vídeo/som).
 
 O codec G.729 (8 kbit/s) é patenteado — o PJSIP não o inclui por padrão. Este
 projeto compila o PJSIP 2.14 com o [BCG729](https://github.com/BelledonneCommunications/bcg729)
-(incluído no `third_party` do PJSIP), habilitado em `pjlib/include/pj/config_site.h`:
-
-```c
-#define PJMEDIA_HAS_G729_CODEC 1
-```
+(biblioteca do sistema, pacote `libbcg729-dev`). O `./configure --with-bcg729`
+detecta a lib e grava `PJMEDIA_HAS_BCG729 1` em
+`pjlib/include/pj/compat/os_auto.h` (não é preciso declarar macro no
+`config_site.h`).
 
 Para reproduzir o build do PJSIP:
 
 ```bash
-./configure --with-bcg729
-make dep && make -j$(nproc)
-sudo make install && sudo ldconfig
+./build_pjsip.sh
 ```
 
-O BCG729 é embutido **estaticamente** em `libpjmedia-codec.so`, então o binário
-PyInstaller e o AppImage não ganham dependência extra. Para confirmar que o G.729
-está ativo:
+O BCG729 **não** é embutido estaticamente em `libpjmedia-codec.so`: ele é
+ligado dinamicamente (`-lbcg729`). O `build_exe.sh` empacota as libs
+dependentes no bundle/AppImage. Para confirmar que o G.729 está ativo:
 
 ```bash
-nm -D /usr/local/lib/libpjmedia-codec.so | grep -i bcg729
+nm -D third_party/pjsip-dist/lib/libpjmedia-codec.so | grep -i bcg729
 ```
 
 Na tela **Codecs** do app, `G729/8000/1` (e a variante com VAD/CNG `G729B/8000/1`)

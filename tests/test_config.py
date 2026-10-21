@@ -176,6 +176,28 @@ def test_normalize_accounts_phone_preserved_as_typed():
     assert by_user["300"]["phone"] == "5511-2233"        # apenas strip das bordas
 
 
+def test_normalize_accounts_enabled_defaults_true():
+    # campo novo: ausente -> habilitada (compatível com config antiga)
+    sec = FakeSecrets()
+    out = config._normalize_accounts([{"user": "100", "server": "pbx"}], sec)
+    assert out[0]["enabled"] is True
+
+
+def test_normalize_accounts_enabled_preserved():
+    sec = FakeSecrets()
+    accounts = [
+        {"user": "100", "server": "pbx", "enabled": False},
+        {"user": "200", "server": "pbx", "enabled": True},
+        {"user": "300", "server": "pbx", "enabled": "lixo"},  # truthy
+    ]
+    out = config._normalize_accounts(accounts, sec)
+    by_user = {a["user"]: a for a in out}
+    assert by_user["100"]["enabled"] is False
+    assert by_user["200"]["enabled"] is True
+    assert by_user["300"]["enabled"] is True
+
+
+
 def test_clean_cti_default():
     c = config._clean_cti(None)
     assert c == {"enabled": False, "port": 9020, "token": ""}
@@ -243,6 +265,20 @@ def test_default_config_has_keepalive_and_dtmf():
     assert cfg["keepalive"]["enabled"] is True
     assert cfg["keepalive"]["interval_sec"] == 15
     assert cfg["dtmf"]["method"] == "rfc2833"
+    assert cfg["registration"]["failover_after_sec"] == 20
+
+
+def test_clean_registration_defaults_and_values():
+    r = config._clean_registration(None)
+    assert r["failover_after_sec"] == 20
+    assert config._clean_registration("lixo")["failover_after_sec"] == 20
+    assert config._clean_registration({"failover_after_sec": "45"})["failover_after_sec"] == 45
+
+
+def test_clean_registration_clamped():
+    assert config._clean_registration({"failover_after_sec": 0})["failover_after_sec"] == 3
+    assert config._clean_registration({"failover_after_sec": 9999})["failover_after_sec"] == 300
+    assert config._clean_registration({"failover_after_sec": "abc"})["failover_after_sec"] == 20
 
 
 def test_load_config_keepalive_dtmf_roundtrip(tmp_path, monkeypatch):
@@ -252,10 +288,12 @@ def test_load_config_keepalive_dtmf_roundtrip(tmp_path, monkeypatch):
     cfg = config._default_config(sec)
     cfg["keepalive"] = {"enabled": False, "interval_sec": 45}
     cfg["dtmf"] = {"method": "sipinfo", "duration_ms": 250}
+    cfg["registration"] = {"failover_after_sec": 12}
     config.save_config(cfg)
     loaded = config.load_config(sec)
     assert loaded["keepalive"] == {"enabled": False, "interval_sec": 45}
     assert loaded["dtmf"] == {"method": "sipinfo", "duration_ms": 250}
+    assert loaded["registration"] == {"failover_after_sec": 12}
 
 
 def test_clean_updater_default_url():
