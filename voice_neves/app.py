@@ -6784,11 +6784,10 @@ class SoftphoneApp(QMainWindow):
             except Exception:
                 icon = QIcon()
             menu = QMenu()
+            menu.addAction("Abrir", self._show_window)
             menu.addAction("Atender", self._answer_guarded)
             menu.addAction("Desligar", self.hangup)
             menu.addAction("Mute/Unmute", self.toggle_mute)
-            menu.addSeparator()
-            menu.addAction("Abrir", self._show_window)
             menu.addSeparator()
             menu.addAction("Sair", self._quit_app)
             self._tray_menu = menu
