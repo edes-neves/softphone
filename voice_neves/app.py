@@ -460,8 +460,8 @@ def _app_qss():
     QMenu {{ background: {COLOR_CARD}; color: {COLOR_TEXT}; border: 1px solid {COLOR_BORDER}; }}
     QMenu::item {{ padding: 6px 24px; }}
     QMenu::item:selected {{ background: {COLOR_PRIMARY}; color: #FFFFFF; }}
-    QMenuBar {{ background: transparent; color: {COLOR_TEXT}; }}
-    QMenuBar::item {{ background: transparent; padding: 5px 6px; margin: 0 1px; }}
+    QMenuBar {{ background: transparent; color: {COLOR_TEXT}; font-size: 12px; }}
+    QMenuBar::item {{ background: transparent; padding: 3px 4px; margin: 0; }}
     QMenuBar::item:selected {{ background: {COLOR_PRIMARY}; color: #FFFFFF; border-radius: 6px; }}
     QMenuBar::item:pressed {{ background: {COLOR_PRIMARY}; color: #FFFFFF; border-radius: 6px; }}
     QStatusBar {{ background: {COLOR_CARD}; color: {COLOR_MUTED}; }}
