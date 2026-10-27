@@ -433,3 +433,22 @@ nm -D third_party/pjsip-dist/lib/libpjmedia-codec.so | grep -i bcg729
 
 Na tela **Codecs** do app, `G729/8000/1` (e a variante com VAD/CNG `G729B/8000/1`)
 aparecem na lista com prioridade editável.
+
+## Downloads e instalação
+
+Você pode baixar a versão mais recente em [Releases](https://github.com/edes-neves/softphone/releases).
+
+| Pacote | Arquitetura | Como instalar/usar |
+| --- | --- | --- |
+| `VoiceNeves-x86_64.AppImage` | x86_64 | Dê permissão (`chmod +x`) e execute. Pode ser integrado com AppImageLauncher. |
+| `voiceneves_<versão>_<arch>.deb` | amd64/x86_64 | `sudo dpkg -i voiceneves_<versão>_*.deb` e, se necessário, `sudo apt-get install -f`. O atalho *VoiceNeves* fica no menu de aplicativos. |
+| `VoiceNeves-<versão>.x86_64.flatpak` | x86_64 | `flatpak install --user VoiceNeves-<versão>.x86_64.flatpak` ou `flatpak install VoiceNeves-<versão>.x86_64.flatpak` (sistema). Para executar: `flatpak run com.edesneves.VoiceNeves`. |
+
+> **Nota:** os pacotes `.deb` e `.flatpak` são gerados a partir dos scripts em `packaging/`. No Flatpak, as configurações ficam em `~/.var/app/com.edesneves.VoiceNeves/config/softphone/` e os dados em `~/.var/app/com.edesneves.VoiceNeves/data/VoiceNeves/`.
+
+## Atualização automática de pacotes
+
+O app possui atualização automática via `version.json` (veja *Provisionamento e Atualização automática* acima).
+
+- **AppImage**: o próprio app baixa, valida o SHA-256 e orienta a substituir o arquivo e reiniciar.
+- **.deb/Flatpak**: a atualização automática baixa o binário/AppImage pelo `version.json`. Para pacotes gerenciados pelo sistema (`.deb`/`.flatpak`), o recomendado é **atualizar pelo gerenciador de pacotes** (APT/Flatpak) quando houver nova versão na release. O mecanismo interno ainda funciona, mas em ambientes gerenciados é preferível usar o repositório/pacote oficial.
