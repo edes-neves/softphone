@@ -162,9 +162,6 @@ jobs:
           SHA="$(sha256sum VoiceNeves-x86_64.AppImage 2>/dev/null | awk '{print $1}')"
           [ -z "$SHA" ] && SHA=""
           URL="https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/VoiceNeves-x86_64.AppImage"
-          # Windows: o .exe não é compilado pela CI; é publicado manualmente via
-          # `gh release upload "$TAG" VoiceNeves.exe` (e opcionalmente commitado na
-          # raiz). Quando presente, o sha256 é registrado para validar o checksum.
           URL_WIN="https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/VoiceNeves.exe"
           SHA_WIN=""
           for EXE_PATH in "VoiceNeves.exe" "dist/VoiceNeves.exe"; do
@@ -178,18 +175,11 @@ jobs:
             "$VERSION" "$URL" "$SHA" "$URL" "$SHA" "$URL_WIN" "$SHA_WIN" > version.json
           echo "== version.json =="
           cat version.json
-          # 1) Anexa como asset da mesma release
           gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber version.json 2>/dev/null
-          # 2) Commita no branch padrão: URL estável que o app consulta
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git fetch origin master 2>/dev/null
-          git stash push -u -m "ci-stash" 2>/dev/null
-          git checkout -B master origin/master 2>/dev/null || git checkout master 2>/dev/null
-          git stash pop 2>/dev/null || true
-          cp version.json /tmp/version.json.ci 2>/dev/null
-          cp /tmp/version.json.ci version.json 2>/dev/null
+          git fetch --depth=50 origin master 2>/dev/null
           git add version.json
           git commit -m "Release $TAG: atualiza version.json" 2>/dev/null
-          git push origin HEAD:master 2>/dev/null || true
+          git push https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git HEAD:master 2>/dev/null || true
           exit 0
