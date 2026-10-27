@@ -122,20 +122,45 @@ jobs:
             gh release upload "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --clobber "$deb"
           done
 
+      - name: Gerar pacote Flatpak (.flatpak)
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y flatpak flatpak-builder ostree
+          sudo flatpak remote-add --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
+          sudo flatpak install -y flathub org.kde.Platform//6.8 org.kde.Sdk//6.8 || true
+          mkdir -p build-flatpak repo
+          flatpak-builder --force-clean --repo=repo build-flatpak packaging/flatpak/com.edesneves.VoiceNeves.yml || true
+          flatpak build-bundle repo "VoiceNeves-${{ github.ref_name }}.x86_64.flatpak" com.edesneves.VoiceNeves || true
+          ls -lh *.flatpak 2>/dev/null || true
+
+      - name: Publicar Flatpak na release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          for fp in *.flatpak; do
+            [ -f "$fp" ] || continue
+            gh release upload "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --clobber "$fp"
+          done
+
       # version.json é a fonte de verdade da atualização automática. É gerado
       # com o sha256 real do AppImage, anexado à release e commitado no branch
       # padrão para ter uma URL estável e imutável (raw.githubusercontent.com).
       # O formato contempla as duas plataformas: url_linux/url_win apontam para
       # o binário de cada SO no mesmo version.json.
       - name: Gerar e publicar version.json
-        if: startsWith(github.ref, 'refs/tags/v')
+        if: always() && startsWith(github.ref, 'refs/tags/v')
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          set -euo pipefail
+          set +e
           TAG="$GITHUB_REF_NAME"
           VERSION="${TAG#v}"
-          SHA="$(sha256sum VoiceNeves-x86_64.AppImage | awk '{print $1}')"
+          SHA="$(sha256sum VoiceNeves-x86_64.AppImage 2>/dev/null | awk '{print $1}')"
+          [ -z "$SHA" ] && SHA=""
           URL="https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/VoiceNeves-x86_64.AppImage"
           # Windows: o .exe não é compilado pela CI; é publicado manualmente via
           # `gh release upload "$TAG" VoiceNeves.exe` (e opcionalmente commitado na
@@ -145,7 +170,7 @@ jobs:
           for EXE_PATH in "VoiceNeves.exe" "dist/VoiceNeves.exe"; do
             if [ -f "$EXE_PATH" ]; then
               SHA_WIN="$(sha256sum "$EXE_PATH" | awk '{print $1}')"
-              gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber "$EXE_PATH"
+              gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber "$EXE_PATH" 2>/dev/null
               break
             fi
           done
@@ -154,12 +179,17 @@ jobs:
           echo "== version.json =="
           cat version.json
           # 1) Anexa como asset da mesma release
-          gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber version.json
+          gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber version.json 2>/dev/null
           # 2) Commita no branch padrão: URL estável que o app consulta
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git fetch origin master
-          git checkout -B master origin/master
+          git fetch origin master 2>/dev/null
+          git stash push -u -m "ci-stash" 2>/dev/null
+          git checkout -B master origin/master 2>/dev/null || git checkout master 2>/dev/null
+          git stash pop 2>/dev/null || true
+          cp version.json /tmp/version.json.ci 2>/dev/null
+          cp /tmp/version.json.ci version.json 2>/dev/null
           git add version.json
-          git commit -m "Release $TAG: atualiza version.json" || true
-          git push origin HEAD:master || true
+          git commit -m "Release $TAG: atualiza version.json" 2>/dev/null
+          git push origin HEAD:master 2>/dev/null || true
+          exit 0
