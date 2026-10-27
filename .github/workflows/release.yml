@@ -152,12 +152,11 @@ jobs:
       # O formato contempla as duas plataformas: url_linux/url_win apontam para
       # o binário de cada SO no mesmo version.json.
       - name: Gerar e publicar version.json
-        if: always() && startsWith(github.ref, 'refs/tags/v')
-        continue-on-error: true
+        if: startsWith(github.ref, 'refs/tags/v')
         env:
           GH_TOKEN: ${{ github.token }}
+        continue-on-error: true
         run: |
-          set +e
           TAG="$GITHUB_REF_NAME"
           VERSION="${TAG#v}"
           SHA="$(sha256sum VoiceNeves-x86_64.AppImage 2>/dev/null | awk '{print $1}')"
@@ -165,17 +164,15 @@ jobs:
           URL="https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/VoiceNeves-x86_64.AppImage"
           URL_WIN="https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/VoiceNeves.exe"
           SHA_WIN=""
-          for EXE_PATH in "VoiceNeves.exe" "dist/VoiceNeves.exe"; do
-            if [ -f "$EXE_PATH" ]; then
-              SHA_WIN="$(sha256sum "$EXE_PATH" | awk '{print $1}')"
-              gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber "$EXE_PATH" 2>/dev/null
-              break
-            fi
-          done
+          if [ -f VoiceNeves.exe ]; then
+            SHA_WIN="$(sha256sum VoiceNeves.exe | awk '{print $1}')"
+            gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber VoiceNeves.exe 2>/dev/null || true
+          elif [ -f dist/VoiceNeves.exe ]; then
+            SHA_WIN="$(sha256sum dist/VoiceNeves.exe | awk '{print $1}')"
+            gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber dist/VoiceNeves.exe 2>/dev/null || true
+          fi
           printf '{"version":"%s","url":"%s","sha256":"%s","url_linux":"%s","sha256_linux":"%s","url_win":"%s","sha256_win":"%s"}\n' \
             "$VERSION" "$URL" "$SHA" "$URL" "$SHA" "$URL_WIN" "$SHA_WIN" > version.json
           echo "== version.json =="
           cat version.json
-          gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber version.json 2>/dev/null
-          true
-          exit 0
+          gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber version.json 2>/dev/null || true
