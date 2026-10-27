@@ -15,6 +15,8 @@ jobs:
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - uses: actions/setup-python@v5
         with:
@@ -90,7 +92,10 @@ jobs:
           gh release create "$GITHUB_REF_NAME" \
             --repo "$GITHUB_REPOSITORY" \
             --title "$GITHUB_REF_NAME" \
-            --generate-notes || true
+            --notes-file <(git tag -l -n999 "$GITHUB_REF_NAME") 2>&1 | tail -2 || true
+          gh release edit "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --notes-file <(git tag -l -n999 "$GITHUB_REF_NAME") 2>&1 | tail -2 || true
           gh release upload "$GITHUB_REF_NAME" \
             --repo "$GITHUB_REPOSITORY" \
             --clobber VoiceNeves-x86_64.AppImage
@@ -153,7 +158,8 @@ jobs:
           # 2) Commita no branch padrão: URL estável que o app consulta
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git fetch origin master
+          git checkout -B master origin/master
           git add version.json
           git commit -m "Release $TAG: atualiza version.json" || true
-          git push origin HEAD:master
-
+          git push origin HEAD:master || true
