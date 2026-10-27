@@ -1,0 +1,31 @@
+app-id: com.edesneves.VoiceNeves
+runtime: org.kde.Platform
+runtime-version: '6.8'
+sdk: org.kde.Sdk
+command: voiceneves
+finish-args:
+  - --share=ipc
+  - --socket=x11
+  - --socket=wayland
+  - --socket=pulseaudio
+  - --share=network
+  - --device=dri
+  - --talk-name=org.freedesktop.Notifications
+  - --filesystem=~/.config/softphone:rw
+  - --filesystem=~/.local/share/VoiceNeves:rw
+modules:
+  - name: voiceneves
+    buildsystem: simple
+    build-commands:
+      - pip3 install --prefix=/app --no-cache-dir -r requirements.txt
+      - mkdir -p /app/share/voiceneves
+      - cp -r voice_neves /app/share/voiceneves/
+      - cp softphone.py /app/share/voiceneves/
+      - cp -r *.png *.ico *.wav 2>/dev/null || true
+      - install -Dm755 packaging/flatpak/voiceneves.sh /app/bin/voiceneves
+      - install -Dm644 VoiceNeves.desktop /app/share/applications/com.edesneves.VoiceNeves.desktop
+      - install -Dm644 voiceneves.png /app/share/icons/hicolor/256x256/apps/com.edesneves.VoiceNeves.png
+      - install -Dm644 voiceneves.png /app/share/icons/hicolor/512x512/apps/com.edesneves.VoiceNeves.png
+    sources:
+      - type: dir
+        path: ../..
