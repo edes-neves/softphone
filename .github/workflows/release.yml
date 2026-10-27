@@ -95,6 +95,28 @@ jobs:
             --repo "$GITHUB_REPOSITORY" \
             --clobber VoiceNeves-x86_64.AppImage
 
+      - name: Gerar pacote .deb
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          LD_LIBRARY_PATH: ${{ github.workspace }}/third_party/pjsip-dist/lib
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ruby ruby-dev rubygems build-essential rpm
+          sudo gem install --no-document fpm || true
+          chmod +x packaging/build_deb.sh || true
+          ./packaging/build_deb.sh || true
+          ls -lh *.deb 2>/dev/null || true
+
+      - name: Publicar .deb na release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          for deb in *.deb; do
+            [ -f "$deb" ] || continue
+            gh release upload "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --clobber "$deb"
+          done
+
       # version.json é a fonte de verdade da atualização automática. É gerado
       # com o sha256 real do AppImage, anexado à release e commitado no branch
       # padrão para ter uma URL estável e imutável (raw.githubusercontent.com).
