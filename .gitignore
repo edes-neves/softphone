@@ -37,3 +37,9 @@ tempCodeRunnerFile.py
 .coverage
 htmlcov/
 .pytest_cache/
+
+# Cache de ferramentas
+.ruff_cache/
+
+# Pacotes fonte baixados localmente
+softphone-master.zip
