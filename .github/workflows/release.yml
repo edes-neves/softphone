@@ -178,8 +178,12 @@ jobs:
           gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber version.json 2>/dev/null
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git fetch --depth=50 origin master 2>/dev/null
+          cp version.json /tmp/version.json.out
+          git fetch origin master:refs/remotes/origin/master 2>/dev/null
+          git update-ref refs/heads/master origin/master 2>/dev/null
+          git checkout master 2>/dev/null
+          cp /tmp/version.json.out version.json
           git add version.json
           git commit -m "Release $TAG: atualiza version.json" 2>/dev/null
-          git push https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git HEAD:master 2>/dev/null || true
+          git push https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git master 2>/dev/null || true
           exit 0
