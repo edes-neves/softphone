@@ -177,4 +177,5 @@ jobs:
           echo "== version.json =="
           cat version.json
           gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber version.json 2>/dev/null
+          true
           exit 0
