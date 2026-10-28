@@ -92,6 +92,36 @@ from .provisioning import ProvisioningManager, prov_cache_path
 from .updater import DownloadCanceled, Updater, is_newer
 
 
+def _register_pjsip_thread(name="external"):
+    """Registra thread externa no pjsua2 para evitar pj_thread_this assert."""
+    try:
+        import pjsua2 as pj
+    except Exception:
+        return False
+    try:
+        try:
+            desc = pj.thread_desc()
+            pj.thread_register(name, desc)
+            return True
+        except TypeError:
+            try:
+                pj.thread_register(name)
+                return True
+            except Exception:
+                pass
+        except Exception:
+            pass
+        try:
+            if hasattr(pj, "thread_register"):
+                pj.thread_register(name)
+                return True
+        except Exception:
+            pass
+    except Exception:
+        pass
+    return False
+
+
 def pj_error_text(e):
     """Formata um erro do pjsua2 (pj.Error) com a mensagem real do PJSIP."""
     if isinstance(e, pj.Error):
@@ -7145,6 +7175,10 @@ class SoftphoneApp(QMainWindow):
 
         def worker():
             try:
+                _register_pjsip_thread("updater-check")
+            except Exception:
+                pass
+            try:
                 available = self._updater.check(url, uc.get("auth_user", ""))
                 if available:
                     self._ui(self._on_update_available, self._updater.latest)
@@ -7194,6 +7228,10 @@ class SoftphoneApp(QMainWindow):
         self._make_update_progress()
 
         def worker():
+            try:
+                _register_pjsip_thread("updater-download")
+            except Exception:
+                pass
             try:
                 self._updater.download(
                     on_progress=lambda done, total: self._ui(self._update_progress, done, total),
@@ -7277,6 +7315,10 @@ class SoftphoneApp(QMainWindow):
             return
 
         def worker():
+            try:
+                _register_pjsip_thread("updater-menu")
+            except Exception:
+                pass
             try:
                 self._updater.check(url, uc.get("auth_user", ""))
                 # Só chama o callback quando há resposta remota: latest None
