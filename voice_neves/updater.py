@@ -30,6 +30,7 @@ import sys
 import time
 import urllib.parse
 import urllib.request
+import ssl
 
 __all__ = [
     "parse_version_info",
@@ -112,6 +113,16 @@ def parse_version_info(raw):
     }
 
 
+def _create_ssl_context():
+    """Cria contexto SSL confiável, usando certifi se disponível."""
+    try:
+        import certifi
+
+        return ssl.create_default_context(cafile=certifi.where())
+    except Exception:
+        return ssl.create_default_context()
+
+
 def fetch_version_info(url, timeout=10, auth_user="", auth_pass=""):
     """Baixa e valida um version.json da URL remota."""
     req = urllib.request.Request(url, headers={"Accept": "application/json"})
@@ -120,7 +131,8 @@ def fetch_version_info(url, timeout=10, auth_user="", auth_pass=""):
 
         token = base64.b64encode(f"{auth_user}:{auth_pass}".encode()).decode()
         req.add_header("Authorization", f"Basic {token}")
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
+    context = _create_ssl_context()
+    with urllib.request.urlopen(req, timeout=timeout, context=context) as resp:
         raw = json.loads(resp.read().decode("utf-8"))
     return parse_version_info(raw)
 
@@ -174,8 +186,9 @@ def _download(url, dest_dir, on_progress=None, cancel_cb=None, timeout=60, auth_
     os.makedirs(dest_dir, exist_ok=True)
     dest = os.path.join(dest_dir, f"{name}.partial")
     canceled = False
+    context = _create_ssl_context()
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp, open(dest, "wb") as out:
+        with urllib.request.urlopen(req, timeout=timeout, context=context) as resp, open(dest, "wb") as out:
             headers = getattr(resp, "headers", None)
             total = None
             try:

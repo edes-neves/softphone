@@ -1,6 +1,9 @@
 # Dependências de build/empacotamento
 pyinstaller>=6.0
 
+# Certificados TLS confiáveis (necessário em AppImage/alguns distros)
+certifi>=2023.7.22
+
 # Interface gráfica (Qt via PySide6)
 PySide6>=6.0
 
