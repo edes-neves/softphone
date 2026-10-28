@@ -107,7 +107,10 @@ log "Gerando executável..."
     --collect-submodules voice_neves \
     --collect-submodules keyring \
     --collect-data keyring \
-    --hidden-import pynput
+    --collect-submodules certifi \
+    --collect-data certifi \
+    --hidden-import pynput \
+    --hidden-import certifi
 
 log "Pronto: dist/VoiceNeves/VoiceNeves"
 log "Teste: cd dist/VoiceNeves && ./VoiceNeves"
