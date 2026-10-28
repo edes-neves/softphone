@@ -195,9 +195,10 @@ def _download(url, dest_dir, on_progress=None, cancel_cb=None, timeout=60, auth_
     canceled = False
     try:
         try:
-            with urllib.request.urlopen(req, timeout=timeout, context=_create_ssl_context()) as resp, open(dest, "wb") as out:
+            resp_ctx = urllib.request.urlopen(req, timeout=timeout, context=_create_ssl_context())
         except TypeError:
-            with urllib.request.urlopen(req, timeout=timeout) as resp, open(dest, "wb") as out:
+            resp_ctx = urllib.request.urlopen(req, timeout=timeout)
+        with resp_ctx as resp, open(dest, "wb") as out:
             headers = getattr(resp, "headers", None)
             total = None
             try:
