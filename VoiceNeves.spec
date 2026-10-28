@@ -3,10 +3,12 @@ from PyInstaller.utils.hooks import collect_data_files
 from PyInstaller.utils.hooks import collect_submodules
 
 datas = [('ringtone.wav', '.'), ('Icone.png', '.'), ('voiceneves.png', '.')]
-hiddenimports = ['pjsua2', 'pynput']
+hiddenimports = ['pjsua2', 'pynput', 'certifi']
 datas += collect_data_files('keyring')
+datas += collect_data_files('certifi')
 hiddenimports += collect_submodules('voice_neves')
 hiddenimports += collect_submodules('keyring')
+hiddenimports += collect_submodules('certifi')
 
 
 a = Analysis(
