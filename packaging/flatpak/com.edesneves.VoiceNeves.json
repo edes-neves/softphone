@@ -13,28 +13,37 @@
         "--device=dri",
         "--talk-name=org.freedesktop.Notifications",
         "--filesystem=~/.config/softphone:rw",
-        "--filesystem=~/.local/share/VoiceNeves:rw"
+        "--filesystem=~/.local/share/softphone:rw"
     ],
     "modules": [
         {
             "name": "voiceneves",
             "buildsystem": "simple",
             "build-commands": [
-                "pip3 install --prefix=/app --no-cache-dir -r requirements.txt",
                 "mkdir -p /app/share/voiceneves",
-                "cp -r voice_neves /app/share/voiceneves/",
-                "cp softphone.py /app/share/voiceneves/",
-                "cp -r *.png *.ico *.wav 2>/dev/null || true",
-                "cp -r tests 2>/dev/null || true",
-                "install -Dm755 packaging/flatpak/voiceneves.sh /app/bin/voiceneves",
+                "cp -a . /app/share/voiceneves/",
+                "install -Dm755 voiceneves.sh /app/bin/voiceneves",
                 "install -Dm644 VoiceNeves.desktop /app/share/applications/com.edesneves.VoiceNeves.desktop",
                 "install -Dm644 voiceneves.png /app/share/icons/hicolor/256x256/apps/com.edesneves.VoiceNeves.png",
-                "install -Dm644 voiceneves.png /app/share/icons/hicolor/512x512/apps/com.edesneves.VoiceNeves.png"
+                "install -Dm644 voiceneves.png /app/share/icons/hicolor/512x512/apps/com.edesneves.VoiceNeves.png",
+                "install -Dm644 voiceneves.png /app/share/icons/hicolor/256x256/apps/voiceneves.png"
             ],
             "sources": [
                 {
                     "type": "dir",
-                    "path": "../.."
+                    "path": "../../dist/VoiceNeves"
+                },
+                {
+                    "type": "file",
+                    "path": "voiceneves.sh"
+                },
+                {
+                    "type": "file",
+                    "path": "../../VoiceNeves.desktop"
+                },
+                {
+                    "type": "file",
+                    "path": "../../voiceneves.png"
                 }
             ]
         }

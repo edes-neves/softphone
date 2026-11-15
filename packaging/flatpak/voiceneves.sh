@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# Launcher do Flatpak: roda o bundle autossuficiente do PyInstaller (já inclui
+# Python + pjsua2/PJSIP). O binário localiza seu próprio _internal, então basta
+# executá-lo a partir do diretório instalado.
 cd /app/share/voiceneves
-export PYTHONPATH=/app/lib/python3.12/site-packages:/app/lib/python3/site-packages:$PYTHONPATH
-exec python3 softphone.py "$@"
+exec /app/share/voiceneves/VoiceNeves "$@"
