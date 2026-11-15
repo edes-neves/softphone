@@ -468,15 +468,33 @@ Você pode baixar a versão mais recente em [Releases](https://github.com/edes-n
 ### Flatpak via repositório (instalar/atualizar pelo "Programas")
 
 Além do `.flatpak` avulso, há um **repositório Flatpak** assinado com GPG, publicado no
-GitHub Pages. Adicione-o uma vez e o app aparece no **GNOME Software / KDE Discover**
-("Programas"), onde você instala e **atualiza** normalmente:
+GitHub Pages. Adicione-o uma vez e o app passa a aparecer no **GNOME Software /
+KDE Discover** ("Programas"), onde você instala e **atualiza** normalmente.
+
+**1. Pré-requisito — ter o Flatpak e o Flathub** (o app depende do runtime
+`org.kde.Platform` 6.8, baixado do Flathub):
+
+```bash
+# Debian/Ubuntu
+sudo apt install flatpak
+# Fedora
+sudo dnf install flatpak
+
+flatpak remote-add --if-not-exists --user flathub \
+  https://flathub.org/repo/flathub.flatpakrepo
+```
+
+**2. Adicionar o repositório do Voice Neves** (só para o seu usuário):
 
 ```bash
 flatpak remote-add --if-not-exists voiceneves \
   https://edes-neves.github.io/softphone/voiceneves.flatpakrepo
 ```
 
-Depois procure por **Voice Neves** no "Programas", ou instale direto:
+**3. Instalar**
+
+- Pelo **"Programas"**: abra o app, procure por **Voice Neves** e clique em instalar.
+- Ou pela linha de comando:
 
 ```bash
 flatpak install voiceneves com.edesneves.VoiceNeves
@@ -485,7 +503,15 @@ flatpak install voiceneves com.edesneves.VoiceNeves
 Também dá para instalar em um clique com o arquivo `.flatpakref`:
 `https://edes-neves.github.io/softphone/com.edesneves.VoiceNeves.flatpakref`.
 
-> **Nota:** os pacotes `.deb` e `.flatpak` são gerados a partir dos scripts em `packaging/`. No Flatpak, as configurações ficam em `~/.var/app/com.edesneves.VoiceNeves/config/softphone/` e os dados em `~/.var/app/com.edesneves.VoiceNeves/data/VoiceNeves/`. O repositório Flatpak (OSTree + sumário assinado) é gerado e publicado no GitHub Pages pelo workflow de release (`secrets.FLATPAK_GPG_PRIVATE_KEY`).
+**4. Executar / atualizar / desinstalar**
+
+```bash
+flatpak run com.edesneves.VoiceNeves   # executar
+flatpak update com.edesneves.VoiceNeves # atualizar (ou pelo "Programas")
+flatpak uninstall com.edesneves.VoiceNeves
+```
+
+> **Nota:** os pacotes `.deb` e `.flatpak` são gerados a partir dos scripts em `packaging/`. No Flatpak, as configurações ficam em `~/.var/app/com.edesneves.VoiceNeves/config/softphone/` e os dados em `~/.var/app/com.edesneves.VoiceNeves/data/VoiceNeves/`. O repositório Flatpak (OSTree + commits/sumário assinados) é gerado e publicado no GitHub Pages pelo workflow de release (`secrets.FLATPAK_GPG_PRIVATE_KEY`).
 
 ## Atualização automática de pacotes
 
