@@ -109,6 +109,9 @@ jobs:
           sudo apt-get install -y ruby ruby-dev rubygems build-essential rpm
           sudo gem install --no-document fpm || true
           chmod +x packaging/build_deb.sh || true
+          # Remove .deb versionados no repo (ex.: artefato de release anterior)
+          # para o glob de publicação pegar só o pacote recém-gerado.
+          rm -f *.deb
           ./packaging/build_deb.sh || true
           ls -lh *.deb 2>/dev/null || true
 
