@@ -7,12 +7,17 @@ on:
 
 permissions:
   contents: write
+  pages: write
+  id-token: write
 
 jobs:
   appimage:
     # ubuntu-22.04 (glibc antigo) mantém o AppImage compatível com
     # Ubuntu 22.04+, BigLinux e derivados — não trocar por ubuntu-latest.
     runs-on: ubuntu-22.04
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy_pages.outputs.page_url }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -125,19 +130,79 @@ jobs:
             gh release upload "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --clobber "$deb"
           done
 
-      - name: Gerar pacote Flatpak (.flatpak)
+      - name: Gerar pacote Flatpak e repositório OSTree assinado
         if: startsWith(github.ref, 'refs/tags/v')
         env:
           GH_TOKEN: ${{ github.token }}
+          FLATPAK_GPG_PRIVATE_KEY: ${{ secrets.FLATPAK_GPG_PRIVATE_KEY }}
         run: |
           sudo apt-get update
           sudo apt-get install -y flatpak flatpak-builder ostree
           sudo flatpak remote-add --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
           sudo flatpak install -y flathub org.kde.Platform//6.8 org.kde.Sdk//6.8 || true
+
+          # Chave GPG (secret FLATPAK_GPG_PRIVATE_KEY) para assinar o repositório
+          # Flatpak. É importada ANTES do build para o flatpak-builder já assinar
+          # cada commit do export (o cliente exige assinatura de commit e sumário).
+          export GNUPGHOME="$(mktemp -d)"; chmod 700 "$GNUPGHOME"
+          printf '%s' "$FLATPAK_GPG_PRIVATE_KEY" | gpg --batch --import 2>/dev/null || true
+          GPG_FPR="$(gpg --list-secret-keys --with-colons | awk -F: '/^fpr:/{print $10; exit}')"
+          echo "GPG fingerprint: $GPG_FPR"
+          SIGN_ARGS=()
+          if [ -n "$GPG_FPR" ]; then
+            SIGN_ARGS=(--gpg-sign="$GPG_FPR" --gpg-homedir="$GNUPGHOME")
+          fi
+
           mkdir -p build-flatpak repo
-          flatpak-builder --force-clean --repo=repo build-flatpak packaging/flatpak/com.edesneves.VoiceNeves.yml || true
+          flatpak-builder --force-clean --repo=repo "${SIGN_ARGS[@]}" \
+            build-flatpak packaging/flatpak/com.edesneves.VoiceNeves.yml || true
           flatpak build-bundle repo "VoiceNeves-${{ github.ref_name }}.x86_64.flatpak" com.edesneves.VoiceNeves || true
           ls -lh *.flatpak 2>/dev/null || true
+
+          # --- Repositório Flatpak remoto (para o app "Programas"/GNOME Software) ---
+          flatpak build-update-repo --generate-static-deltas \
+            --title="Voice Neves" --comment="Softphone SIP (Voice Neves)" \
+            --homepage="https://github.com/${GITHUB_REPOSITORY}" \
+            "${SIGN_ARGS[@]}" repo || true
+          echo "== refs do repo =="; ostree refs --repo=repo || true
+
+          # Monta o site do GitHub Pages: o repo + os arquivos .flatpakrepo/.flatpakref
+          PAGES_BASE="https://${GITHUB_REPOSITORY_OWNER}.github.io/${GITHUB_REPOSITORY#*/}"
+          mkdir -p pages
+          cp -a repo pages/repo
+          PUB_B64="$(gpg --homedir "$GNUPGHOME" --armor --export "$GPG_FPR" | base64 -w0)"
+          BRANCH="$(ostree refs --repo=repo | sed -n 's#^app/com.edesneves.VoiceNeves/x86_64/##p' | head -1)"
+          BRANCH="${BRANCH:-master}"
+          {
+            echo '[Flatpak Repo]'
+            echo 'Title=Voice Neves'
+            echo "Url=${PAGES_BASE}/repo/"
+            echo "Homepage=https://github.com/${GITHUB_REPOSITORY}"
+            echo 'Comment=Softphone SIP (Voice Neves)'
+            echo "GPGKey=${PUB_B64}"
+          } > pages/voiceneves.flatpakrepo
+          {
+            echo '[Flatpak Ref]'
+            echo 'Title=Voice Neves'
+            echo 'Name=com.edesneves.VoiceNeves'
+            echo "Branch=${BRANCH}"
+            echo "Url=${PAGES_BASE}/repo/"
+            echo "GPGKey=${PUB_B64}"
+            echo 'IsRuntime=false'
+            echo "RuntimeRepo=${PAGES_BASE}/voiceneves.flatpakrepo"
+          } > pages/com.edesneves.VoiceNeves.flatpakref
+          ls -lh pages pages/repo 2>/dev/null || true
+
+      - name: Upload do site (Pages)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: pages
+
+      - name: Deploy no GitHub Pages
+        if: startsWith(github.ref, 'refs/tags/v')
+        id: deploy_pages
+        uses: actions/deploy-pages@v4
 
       - name: Publicar Flatpak na release
         if: startsWith(github.ref, 'refs/tags/v')

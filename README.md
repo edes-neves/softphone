@@ -465,7 +465,27 @@ Você pode baixar a versão mais recente em [Releases](https://github.com/edes-n
 | `voiceneves_<versão>_<arch>.deb` | amd64/x86_64 | `sudo dpkg -i voiceneves_<versão>_*.deb` e, se necessário, `sudo apt-get install -f`. O atalho *VoiceNeves* fica no menu de aplicativos. |
 | `VoiceNeves-<versão>.x86_64.flatpak` | x86_64 | `flatpak install --user VoiceNeves-<versão>.x86_64.flatpak` ou `flatpak install VoiceNeves-<versão>.x86_64.flatpak` (sistema). Para executar: `flatpak run com.edesneves.VoiceNeves`. |
 
-> **Nota:** os pacotes `.deb` e `.flatpak` são gerados a partir dos scripts em `packaging/`. No Flatpak, as configurações ficam em `~/.var/app/com.edesneves.VoiceNeves/config/softphone/` e os dados em `~/.var/app/com.edesneves.VoiceNeves/data/VoiceNeves/`.
+### Flatpak via repositório (instalar/atualizar pelo "Programas")
+
+Além do `.flatpak` avulso, há um **repositório Flatpak** assinado com GPG, publicado no
+GitHub Pages. Adicione-o uma vez e o app aparece no **GNOME Software / KDE Discover**
+("Programas"), onde você instala e **atualiza** normalmente:
+
+```bash
+flatpak remote-add --if-not-exists voiceneves \
+  https://edes-neves.github.io/softphone/voiceneves.flatpakrepo
+```
+
+Depois procure por **Voice Neves** no "Programas", ou instale direto:
+
+```bash
+flatpak install voiceneves com.edesneves.VoiceNeves
+```
+
+Também dá para instalar em um clique com o arquivo `.flatpakref`:
+`https://edes-neves.github.io/softphone/com.edesneves.VoiceNeves.flatpakref`.
+
+> **Nota:** os pacotes `.deb` e `.flatpak` são gerados a partir dos scripts em `packaging/`. No Flatpak, as configurações ficam em `~/.var/app/com.edesneves.VoiceNeves/config/softphone/` e os dados em `~/.var/app/com.edesneves.VoiceNeves/data/VoiceNeves/`. O repositório Flatpak (OSTree + sumário assinado) é gerado e publicado no GitHub Pages pelo workflow de release (`secrets.FLATPAK_GPG_PRIVATE_KEY`).
 
 ## Atualização automática de pacotes
 

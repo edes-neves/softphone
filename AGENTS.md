@@ -87,3 +87,19 @@ a pilha PJSIP (`pjsua2`) e desenha a UI com PySide6. O ponto de entrada é
 - PJSIP: `./build_pjsip.sh` (grava em `third_party/pjsip-dist/`).
 - Executável/AppImage: `./build_exe.sh` (precisa do passo acima).
 - `.deb`/Flatpak: scripts em `packaging/`.
+
+## Release e repositório Flatpak
+
+- Release: `./bump.sh <versão>` (bump de `voice_neves/__init__.py`, commit, tag
+  `v<versão>`, push). O workflow `.github/workflows/release.yml` roda na tag e
+  gera AppImage, `.deb`, `.flatpak` e o **repositório Flatpak**.
+- O repo Flatpak é um OSTree assinado com GPG e publicado no **GitHub Pages**
+  (`https://edes-neves.github.io/softphone/`), junto de `voiceneves.flatpakrepo`
+  e `com.edesneves.VoiceNeves.flatpakref`. O cliente (`flatpak`/GNOME Software)
+  exige **assinatura de commit e de sumário**, por isso `flatpak-builder` e
+  `flatpak build-update-repo` recebem `--gpg-sign`.
+- A chave privada de assinatura fica no secret **`FLATPAK_GPG_PRIVATE_KEY`**
+  (fingerprint `B5E44D30744036013ED6482F73D7029769729D73`). Sem o secret, o build
+  segue mas o repo sai sem assinatura (não instala com verificação GPG).
+- GitHub Pages está configurado com `build_type=workflow` (deploy via
+  `actions/upload-pages-artifact` + `actions/deploy-pages`).
