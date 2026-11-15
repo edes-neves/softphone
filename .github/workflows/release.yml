@@ -179,3 +179,11 @@ jobs:
           echo "== version.json =="
           cat version.json
           gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber version.json 2>/dev/null || true
+          # O updater lê version.json do branch padrão (raw.githubusercontent.com),
+          # não do asset da release. Sem este commit o app nunca veria a versão
+          # nova. A tag é criada sobre o master, então o push é fast-forward.
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add version.json
+          git commit -m "chore: version.json para ${TAG}" || true
+          git push origin HEAD:master || true
