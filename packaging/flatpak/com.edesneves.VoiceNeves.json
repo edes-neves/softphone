@@ -22,11 +22,11 @@
             "build-commands": [
                 "mkdir -p /app/share/voiceneves",
                 "cp -a . /app/share/voiceneves/",
+                "sed -i 's|^Icon=.*|Icon=com.edesneves.VoiceNeves|' VoiceNeves.desktop",
                 "install -Dm755 voiceneves.sh /app/bin/voiceneves",
                 "install -Dm644 VoiceNeves.desktop /app/share/applications/com.edesneves.VoiceNeves.desktop",
                 "install -Dm644 voiceneves.png /app/share/icons/hicolor/256x256/apps/com.edesneves.VoiceNeves.png",
-                "install -Dm644 voiceneves.png /app/share/icons/hicolor/512x512/apps/com.edesneves.VoiceNeves.png",
-                "install -Dm644 voiceneves.png /app/share/icons/hicolor/256x256/apps/voiceneves.png"
+                "install -Dm644 voiceneves.png /app/share/icons/hicolor/512x512/apps/com.edesneves.VoiceNeves.png"
             ],
             "sources": [
                 {
