@@ -15,8 +15,10 @@ venv/
 *.log
 sip_config.json
 
-# AppImage (artefato de build)
+# Artefatos de build (AppImage, .deb)
 *.AppImage
+*.deb
+*.bak
 
 # Scripts locais de release
 git_push.sh

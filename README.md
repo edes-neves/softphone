@@ -218,13 +218,34 @@ etc.).
 ## Funcionalidades
 
 - Registro SIP de múltiplas contas com indicador de status (online/registrando/offline)
+- Contas SIP exibidas em cards; clique para selecionar e arraste para reordenar
+  (a ordem é persistida em `config.json`)
 - Chamadas de saída usando a conta selecionada na lista (fallback: primeira online)
 - Chamadas de entrada com botão **Atender** e estado de chamada na tela
+- Janela unificada de **Configurações avançadas** (abas **Codecs**, **Vídeo**,
+  **Segurança e NAT** e **Provisionamento**), aberta por **Configurações →
+  Avançado...**
+- Prévia da câmera e vídeo da chamada exibidos na mesma área **Vídeo da
+  chamada** (nunca ao mesmo tempo; o app avisa e encerra um para mostrar o outro)
 - Mute de microfone, volume de saída e entrada
 - Seleção de dispositivos de áudio (entrada/saída)
 - Tema claro/escuro (menu **Exibir → Tema Escuro**), persistido na configuração
 - Codec G.729 (grátis) via BCG729, embutido estaticamente no `libpjmedia-codec.so`
 - Logs detalhados em arquivo (`app.log`)
+
+## Vídeo (prévia da câmera e vídeo da chamada)
+
+As configurações de vídeo ficam na aba **Vídeo** das Configurações avançadas.
+A **prévia da câmera** e o **vídeo da chamada** são desenhados na mesma área
+**Vídeo da chamada** (a janela nativa do renderizador SDL do pjsua2 é embutida
+nessa área). Como não faz sentido exibir os dois ao mesmo tempo, ao iniciar um
+o app avisa e encerra o outro.
+
+O botão de **espelhamento** da prévia foi removido: o build atual do
+`pjsua2`/`pjmedia` (renderizador SDL) não expõe nenhuma API de *mirror* —
+`VideoWindow.setMirror` não existe e o enum de capacidades só oferece rotação
+(`PJMEDIA_VID_DEV_CAP_ORIENTATION`). O botão apenas registrava erro no log, por
+isso foi retirado da interface.
 
 ## Provisionamento e Atualização automática
 
@@ -233,8 +254,8 @@ etc.).
 O app pode sincronizar contas (e opcionalmente Segurança/NAT) a partir de uma
 config remota servida em JSON, ideal para implantação corporativa: o servidor
 dita os ramais e a política, e o app as aplica. Acesse
-**Config. → Provisionamento e Atualização**: habilite, informe a URL e o
-intervalo de sincronização (5–1440 min). As contas provisionadas são
+**Configurações → Avançado... → aba Provisionamento**: habilite, informe a URL e
+o intervalo de sincronização (5–1440 min). As contas provisionadas são
 **mescladas** com as locais (por `user@server`); senhas vão para o cofre.
 Um **cache local** guarda o último sync válido e é usado como *fallback
 offline*, além de ser aplicado na inicialização.
@@ -261,8 +282,8 @@ guardada no cofre (keyring) sob a chave `provision_auth`.
 
 O app pode checar novas versões, baixar e validar (SHA-256) o novo binário.
 Na inicialização (e periodicamente), o app consulta um `version.json` e avisa
-se houver versão nova. A URL do arquivo é informada em **Config. →
-Provisionamento e Atualização** (campo "URL version.json").
+se houver versão nova. A URL do arquivo é informada em **Configurações →
+Avançado... → aba Provisionamento** (campo "URL version.json").
 
 **Via GitHub (padrão):** o workflow `release.yml` publica o AppImage e o
 `version.json` a cada release com **tag** (ex.: `v1.1.0`), commitando o arquivo
@@ -431,8 +452,8 @@ dependentes no bundle/AppImage. Para confirmar que o G.729 está ativo:
 nm -D third_party/pjsip-dist/lib/libpjmedia-codec.so | grep -i bcg729
 ```
 
-Na tela **Codecs** do app, `G729/8000/1` (e a variante com VAD/CNG `G729B/8000/1`)
-aparecem na lista com prioridade editável.
+Na aba **Codecs** (Configurações → Avançado...) do app, `G729/8000/1` (e a
+variante com VAD/CNG `G729B/8000/1`) aparecem na lista com prioridade editável.
 
 ## Downloads e instalação
 

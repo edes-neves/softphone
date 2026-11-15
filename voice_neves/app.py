@@ -42,6 +42,7 @@ from PySide6.QtCore import (
 )
 from PySide6.QtGui import (
     QAction, QIcon, QColor, QPen, QFont, QCursor, QKeySequence, QDesktopServices,
+    QPainter,
 )
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QDialog, QMessageBox, QInputDialog,
@@ -474,6 +475,28 @@ def _app_qss():
     QListWidget::item:selected, QTreeWidget::item:selected, QTableWidget::item:selected {{
         background: {COLOR_PRIMARY}; color: #FFFFFF;
     }}
+    QListWidget#accountsList {{
+        background: transparent; border: none; padding: 0;
+    }}
+    QListWidget#accountsList::item {{
+        background: {COLOR_CARD}; color: {COLOR_TEXT};
+        border: 1px solid {COLOR_BORDER}; border-radius: 10px;
+        margin: 3px 2px; padding: 7px 10px;
+    }}
+    QListWidget#accountsList::item:hover {{
+        border: 1px solid {COLOR_PRIMARY};
+    }}
+    QListWidget#accountsList::item:selected {{
+        background: {COLOR_PRIMARY}; color: #FFFFFF;
+        border: 1px solid {COLOR_PRIMARY};
+    }}
+    QListWidget#accountsList[mode="call"]::item {{
+        background: transparent; color: {COLOR_TEXT};
+        border: none; border-radius: 0; margin: 0; padding: 3px 6px;
+    }}
+    QListWidget#accountsList[mode="call"]::item:selected {{
+        background: {COLOR_PRIMARY}; color: #FFFFFF; border: none;
+    }}
     QHeaderView::section {{
         background: {COLOR_CARD}; color: {COLOR_TEXT};
         border: none; border-bottom: 1px solid {COLOR_BORDER};
@@ -745,6 +768,87 @@ class DialLineEdit(QLineEdit):
         super().keyPressEvent(event)
 
 
+class ElidedLabel(QLabel):
+    """QLabel que encurta o texto com reticências quando falta espaço.
+
+    O texto completo continua disponível em ``text()``; o desenho é feito
+    manualmente para que a largura mínima não force a janela a crescer.
+    """
+
+    def __init__(self, text="", parent=None, color="#FFFFFF"):
+        super().__init__("", parent)
+        self._full_text = ""
+        self._text_color = QColor(color)
+        self.setMinimumWidth(0)
+        self.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Preferred)
+        self.setText(text)
+
+    def setText(self, text):
+        self._full_text = text or ""
+        super().setText(self._full_text)
+
+    def setTextColor(self, color):
+        self._text_color = QColor(color)
+        self.update()
+
+    def minimumSizeHint(self):
+        hint = super().minimumSizeHint()
+        return QSize(0, hint.height())
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setFont(self.font())
+        painter.setPen(self._text_color)
+        rect = self.contentsRect()
+        text = self.fontMetrics().elidedText(
+            self._full_text, Qt.TextElideMode.ElideRight, rect.width()
+        )
+        painter.drawText(rect, int(self.alignment()), text)
+
+
+class AccountsListWidget(QListWidget):
+    """Lista de contas SIP com visual de cards e reordenação por drag/drop.
+
+    A mesma lista também exibe a chamada ativa. O arrastar/soltar só é
+    habilitado na visão de contas, para não interferir na tela de chamada.
+    """
+
+    orderChanged = Signal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._reorder_enabled = False
+        self.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self._apply_reorder_mode()
+
+    def set_reorder_enabled(self, enabled):
+        enabled = bool(enabled)
+        if enabled == self._reorder_enabled:
+            return
+        self._reorder_enabled = enabled
+        self._apply_reorder_mode()
+
+    def _apply_reorder_mode(self):
+        self.setDragEnabled(self._reorder_enabled)
+        self.setAcceptDrops(self._reorder_enabled)
+        self.viewport().setAcceptDrops(self._reorder_enabled)
+        self.setDropIndicatorShown(self._reorder_enabled)
+        self.setDefaultDropAction(Qt.DropAction.MoveAction)
+        self.setDragDropMode(
+            QAbstractItemView.DragDropMode.InternalMove
+            if self._reorder_enabled
+            else QAbstractItemView.DragDropMode.NoDragDrop
+        )
+
+    def dropEvent(self, event):
+        if not self._reorder_enabled:
+            event.ignore()
+            return
+        super().dropEvent(event)
+        if event.isAccepted():
+            self.orderChanged.emit()
+
+
 # =========================
 # TOAST (feedback não modal)
 # =========================
@@ -915,6 +1019,9 @@ class VideoSurface(QWidget):
         self.setText(text)
         self.setAttribute(Qt.WidgetAttribute.WA_NativeWindow, True)
         self.setStyleSheet("background:black;")
+        # Callback opcional para reajustar a janela nativa de vídeo (pjsua2)
+        # sempre que a superfície mudar de tamanho.
+        self.on_resize = None
         self._label = QLabel(text, self)
         self._label.setStyleSheet("color:#888888; background:transparent; font-size:14px;")
         self._label.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -935,6 +1042,11 @@ class VideoSurface(QWidget):
 
     def resizeEvent(self, event):
         self._label.setGeometry(self.rect())
+        if self.on_resize is not None:
+            try:
+                self.on_resize()
+            except Exception:
+                pass
         super().resizeEvent(event)
 
     def xid(self):
@@ -954,8 +1066,9 @@ class SoftphoneApp(QMainWindow):
         self.qapp = app
         self.setWindowTitle(APP_NAME)
         _decorate_window(self, maximize=True)
-        self.resize(520, 760)
-        self.setMinimumSize(460, 720)
+        self.resize(400, 680)
+        self.setMinimumSize(400, 680)
+        self.setMaximumSize(520, 720)
         self._base_title = APP_NAME
 
         self._icon = QIcon(resource_path("Icone.png"))
@@ -1024,7 +1137,6 @@ class SoftphoneApp(QMainWindow):
         self._screen_device_id = -1
         self._screen_shared = False
         self._video_fullscreen = False
-        self._mirror_on = False
         self._preview_fit_timer = None
         self.video_bandwidth_spin = None
         self.video_resolution_box = None
@@ -1335,28 +1447,37 @@ class SoftphoneApp(QMainWindow):
         lay = QHBoxLayout(header)
         lay.setContentsMargins(16, 0, 14, 0)
 
-        title = QLabel(f"📞  {APP_NAME}")
-        title.setStyleSheet("color:#FFFFFF; font-size:16px; font-weight:700; background:transparent;")
+        title_font = QFont(self.font())
+        title_font.setPixelSize(16)
+        title_font.setBold(True)
+        title = ElidedLabel(f"📞  {APP_NAME}")
+        title.setFont(title_font)
+        title.setStyleSheet("background:transparent;")
         lay.addWidget(title)
 
-        self.timer_label = QLabel("")
-        self.timer_label.setStyleSheet(
-            "color:#FFFFFF; background:transparent; font-weight:700; font-size:14px;"
-        )
+        small_font = QFont(self.font())
+        small_font.setPixelSize(14)
+        small_font.setBold(True)
+        self.timer_label = ElidedLabel("")
+        self.timer_label.setFont(small_font)
+        self.timer_label.setStyleSheet("background:transparent;")
+        self.timer_label.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Preferred)
         lay.addWidget(self.timer_label)
 
-        self.caller_label = QLabel("")
-        self.caller_label.setStyleSheet("color:#FFFFFF; background:transparent; font-weight:700; font-size:14px;")
-        lay.addWidget(self.caller_label)
-
-        lay.addStretch(1)
+        self.caller_label = ElidedLabel("")
+        self.caller_label.setFont(small_font)
+        self.caller_label.setStyleSheet("background:transparent;")
+        lay.addWidget(self.caller_label, 1)
 
         self.status_dot = QLabel("●")
         self.status_dot.setStyleSheet(f"color:{STATUS_COLORS['IDLE']}; font-size:18px; background:transparent;")
         self.status_dot.setFixedWidth(22)
         lay.addWidget(self.status_dot)
-        self.status_label = QLabel(f"Status: {STATE_LABELS['IDLE']}")
-        self.status_label.setStyleSheet("color:#FFFFFF; background:transparent; font-weight:700;")
+        status_font = QFont(self.font())
+        status_font.setBold(True)
+        self.status_label = ElidedLabel(f"Status: {STATE_LABELS['IDLE']}")
+        self.status_label.setFont(status_font)
+        self.status_label.setStyleSheet("background:transparent;")
         lay.addWidget(self.status_label)
         return header
 
@@ -1388,12 +1509,14 @@ class SoftphoneApp(QMainWindow):
 
         # --- Contas SIP ---
         acc_group, acc_v = self._group("Contas SIP", bl)
-        self.listbox = QListWidget()
-        self.listbox.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.listbox = AccountsListWidget()
+        self.listbox.setObjectName("accountsList")
+        self.listbox.setProperty("mode", "accounts")
         self.listbox.setMinimumHeight(90)
         self.listbox.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Ignored)
         self.listbox.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.listbox.customContextMenuRequested.connect(self._show_accounts_context_menu)
+        self.listbox.orderChanged.connect(self._on_accounts_reordered)
         acc_v.addWidget(self.listbox)
 
         # --- Discagem ---
@@ -2282,9 +2405,46 @@ class SoftphoneApp(QMainWindow):
         else:
             self._populate_accounts()
 
+    def _set_accounts_list_mode(self, mode):
+        """Troca o visual da lista (cards de conta x itens de chamada)."""
+        lb = getattr(self, "listbox", None)
+        if lb is None or lb.property("mode") == mode:
+            return
+        lb.setProperty("mode", mode)
+        style = lb.style()
+        style.unpolish(lb)
+        style.polish(lb)
+        lb.update()
+
+    def _on_accounts_reordered(self):
+        """Persiste a nova ordem definida pelo usuário via arrastar/soltar."""
+        if self.call_state != "IDLE":
+            self.refresh()
+            return
+        order = []
+        for i in range(self.listbox.count()):
+            item = self.listbox.item(i)
+            key = item.data(Qt.ItemDataRole.UserRole) if item is not None else None
+            if key:
+                order.append(key)
+        accounts = self.config_data.get("accounts", [])
+        by_key = {_account_key(a): a for a in accounts}
+        if len(order) != len(accounts) or set(order) != set(by_key):
+            self.refresh()
+            return
+        reordered = [by_key[key] for key in order]
+        if reordered == accounts:
+            return
+        self.config_data["accounts"] = reordered
+        save_config(self.config_data)
+        self.refresh()
+        self.show_toast("Ordem das contas atualizada")
+
     def _populate_accounts(self):
         sel = self.selected_account()
         keep_key = f"{sel['data']['user']}@{sel['data']['server']}" if sel else None
+        self._set_accounts_list_mode("accounts")
+        self.listbox.set_reorder_enabled(True)
         self.listbox.clear()
         status_cfg = {
             "ONLINE": (COLOR_SUCCESS, "●", "ONLINE"),
@@ -2323,20 +2483,21 @@ class SoftphoneApp(QMainWindow):
             row = self.listbox.count()
             if keep_key == key:
                 target_row = row
-            item = QListWidgetItem(f"{icon}  {data.get('user')}  ({label}){suffix}")
+            phone = data.get("phone", "")
+            text = f"{icon}  {data.get('user')}  ({label}){suffix}"
+            if phone:
+                text += f"\n      {phone}"
+            item = QListWidgetItem(text)
             item.setForeground(QColor(color))
             item.setData(Qt.ItemDataRole.UserRole, key)
-            item.setToolTip("Habilitada — botão direito para desabilitar"
-                            if status != "DISABLED" else
-                            "Desabilitada — botão direito para habilitar")
-            self.listbox.addItem(item)
-            phone = data.get("phone", "")
+            tip = ("Habilitada — botão direito para desabilitar"
+                   if status != "DISABLED" else
+                   "Desabilitada — botão direito para habilitar")
             if phone:
-                phone_item = QListWidgetItem(f"      {phone}")
-                phone_item.setForeground(QColor(COLOR_SUCCESS))
-                phone_item.setToolTip("Telefone")
-                phone_item.setData(Qt.ItemDataRole.UserRole, None)
-                self.listbox.addItem(phone_item)
+                tip += f"\nTelefone: {phone}"
+            tip += "\nArraste para reordenar"
+            item.setToolTip(tip)
+            self.listbox.addItem(item)
         if target_row is not None and 0 <= target_row < self.listbox.count():
             self.listbox.setCurrentRow(target_row)
         elif self.listbox.count():
@@ -2357,6 +2518,8 @@ class SoftphoneApp(QMainWindow):
         return num or "desconhecido"
 
     def _populate_active_call(self):
+        self._set_accounts_list_mode("call")
+        self.listbox.set_reorder_enabled(False)
         self._call_box_timer_item = None
         self.listbox.clear()
         caller = self._active_caller_display()
@@ -4233,20 +4396,16 @@ class SoftphoneApp(QMainWindow):
         if win is None:
             return False
         self.open_video()
+        if self._preview is not None:
+            self._warn(
+                "Vídeo",
+                "Não é possível exibir o vídeo da chamada e a prévia da câmera "
+                "ao mesmo tempo. A prévia será encerrada.",
+                self.video_win,
+            )
+            self._stop_preview()
         self._remote_window = win
-        surface = self.video_surface
-        if surface is None:
-            return False
-        try:
-            surface.hide_placeholder()
-            xid = surface.xid()
-            win.setWindow(_native_video_handle(xid))
-            win.Show(True)
-            logging.info("Vídeo remoto anexado à janela do app (xid=%s)", xid)
-            return True
-        except Exception as e:
-            logging.warning("Não foi possível anexar o vídeo remoto: %s", e)
-            return False
+        return self._embed_video_window(win)
 
     def _show_video_area(self, show=True):
         if show:
@@ -4982,26 +5141,38 @@ class SoftphoneApp(QMainWindow):
     # =========================
     # CONFIGURAÇÕES AVANÇADAS (abas unificadas)
     # =========================================
-    def open_advanced_tabs(self):
+    def open_advanced_tabs(self, tab=None):
         if self.advtabs_win is None:
             win = QDialog(self)
             win.setWindowTitle("Configurações avançadas")
             _decorate_window(win)
-            win.resize(620, 750)
             win.setMinimumSize(560, 720)
+            win.resize(win.minimumSize())
             win.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, False)
             self.advtabs_win = win
             self._build_advanced_tabs_ui(win)
             self.load_devices()
             self.refresh_codec_list()
+        if tab:
+            self._select_advanced_tab(tab)
         self.advtabs_win.show()
         self.advtabs_win.raise_()
         self.advtabs_win.activateWindow()
+
+    def _select_advanced_tab(self, title):
+        nb = getattr(self, "_adv_tabs", None)
+        if nb is None:
+            return
+        for i in range(nb.count()):
+            if nb.tabText(i) == title:
+                nb.setCurrentIndex(i)
+                return
 
     def _build_advanced_tabs_ui(self, win):
         self._tab_layers = {}
         lay = QVBoxLayout(win)
         nb = QTabWidget()
+        self._adv_tabs = nb
         lay.addWidget(nb)
 
         tab_codecs = self._make_scroll_tab(nb, "Codecs")
@@ -5016,20 +5187,10 @@ class SoftphoneApp(QMainWindow):
         self._build_codec_ui(inner_codecs)
 
         # ---- Vídeo ----
-        vframe = QGroupBox("Vídeo")
-        tab_video.layout().addWidget(vframe)
-        vl = QVBoxLayout(vframe)
-        hint = QLabel(
-            "As configurações de vídeo (câmera, qualidade e prévia) continuam "
-            "na própria janela de Vídeo, que também é usada durante as chamadas "
-            "para exibir o vídeo remoto."
-        )
-        hint.setWordWrap(True)
-        hint.setStyleSheet(f"color:{COLOR_TEXT};")
-        vl.addWidget(hint)
-        btn_open_video = RoundedButton(self, "📹  Abrir configurações de Vídeo...",
-                                       self.open_video, COLOR_PRIMARY, fg="#FFFFFF", pady=6)
-        vl.addWidget(btn_open_video)
+        inner_video = QWidget()
+        tab_video.layout().addWidget(inner_video)
+        self.video_win = win
+        self._build_video_ui(inner_video)
 
         # ---- Segurança e NAT ----
         inner_seg = QWidget()
@@ -5046,17 +5207,9 @@ class SoftphoneApp(QMainWindow):
     # SEGURANÇA E NAT (avançado)
     # =========================
     def open_advanced(self):
-        if self.adv_win is None:
-            win = QDialog(self)
-            win.setWindowTitle("Segurança e NAT")
-            _decorate_window(win)
-            win.resize(460, 660)
-            win.setMinimumSize(420, 620)
-            self.adv_win = win
-            self._build_advanced_ui(win)
-        self.adv_win.show()
-        self.adv_win.raise_()
-        self.adv_win.activateWindow()
+        # Segurança e NAT agora é uma aba da janela unificada de Configurações
+        # avançadas; abrir aqui apenas garante a janela e seleciona a aba.
+        self.open_advanced_tabs(tab="Segurança e NAT")
 
     def _close_advanced(self):
         if self.adv_win is not None:
@@ -5653,18 +5806,11 @@ class SoftphoneApp(QMainWindow):
     # VÍDEO (janela + ações)
     # =========================
     def open_video(self):
-        if self.video_win is None:
-            win = QDialog(self)
-            win.setWindowTitle("Vídeo")
-            _decorate_window(win)
-            win.resize(560, 860)
-            win.setMinimumSize(520, 740)
-            self.video_win = win
-            self._build_video_ui(win)
-            self.load_devices()
-        self.video_win.show()
-        self.video_win.raise_()
-        self.video_win.activateWindow()
+        # As configurações de vídeo agora ficam embutidas na aba "Vídeo" da
+        # janela de Configurações avançadas. Abrir "Vídeo" apenas garante que
+        # essa janela exista e seleciona a aba correta (também usada para
+        # exibir o vídeo remoto durante chamadas).
+        self.open_advanced_tabs(tab="Vídeo")
 
     def _close_video(self):
         self._stop_preview()
@@ -5686,7 +5832,7 @@ class SoftphoneApp(QMainWindow):
         lay.addWidget(call_group, 1)
         cv = QVBoxLayout(call_group)
         self.video_surface = VideoSurface("Vídeo desligado")
-        self.video_surface.setMinimumHeight(320)
+        self.video_surface.setMinimumHeight(120)
         cv.addWidget(self.video_surface, 1)
         self.video_placeholder = self.video_surface
 
@@ -5709,28 +5855,23 @@ class SoftphoneApp(QMainWindow):
         cl.addRow("Câmera", self.video_devices)
         cam_btns = QHBoxLayout()
         self.btn_cam_apply = RoundedButton(self, "Aplicar câmera", self.apply_camera,
-                                           COLOR_PRIMARY, fg="#FFFFFF", pady=5)
+                                           COLOR_PRIMARY, fg="#FFFFFF", pady=5, padding="5px 6px")
         self.btn_video_preview = RoundedButton(self, "Ver prévia", self._toggle_preview,
-                                               COLOR_MUTED, fg=secondary_button_fg(), pady=5)
+                                               COLOR_MUTED, fg=secondary_button_fg(), pady=5, padding="5px 6px")
         self.btn_video_preview_close = RoundedButton(self, "Fechar prévia", self._stop_preview,
-                                                     COLOR_MUTED, fg=secondary_button_fg(), pady=5)
-        self.btn_video_mirror = RoundedButton(self, "🪞 Espelhar", self._toggle_mirror,
-                                              COLOR_MUTED, fg=secondary_button_fg(), pady=5)
+                                                     COLOR_MUTED, fg=secondary_button_fg(), pady=5, padding="5px 6px")
         cam_btns.addWidget(self.btn_cam_apply)
         cam_btns.addWidget(self.btn_video_preview)
         cam_btns.addWidget(self.btn_video_preview_close)
-        cam_btns.addWidget(self.btn_video_mirror)
         cl.addRow(cam_btns)
-        self.video_preview_area = QWidget()
-        self.video_preview_area.setStyleSheet(f"background:black; border:1px solid {COLOR_BORDER};")
-        self.video_preview_area.setMinimumHeight(200)
-        self.video_preview_area.resizeEvent = self._on_preview_area_configure
-        self.video_preview_frame = VideoSurface("Prévia desligada")
-        self.video_preview_frame.setMinimumHeight(180)
-        self.video_preview_frame.setParent(self.video_preview_area)
-        pvp = QVBoxLayout(self.video_preview_area)
-        pvp.addWidget(self.video_preview_frame, 1, Qt.AlignmentFlag.AlignCenter)
-        cl.addRow(self.video_preview_area)
+        # A prévia da câmera é exibida na MESMA superfície do vídeo da chamada
+        # ("Vídeo da chamada"). Os dois nunca são usados ao mesmo tempo; quando
+        # houver conflito, avisamos o usuário (ver _toggle_preview e
+        # _attach_remote_video). Mantemos os nomes antigos como aliases para não
+        # quebrar os pontos que já os referenciam.
+        self.video_preview_area = self.video_surface
+        self.video_preview_frame = self.video_surface
+        self.video_surface.on_resize = self._on_video_surface_resize
 
         settings_group = QGroupBox("Qualidade de vídeo")
         lay.addWidget(settings_group)
@@ -5987,6 +6128,14 @@ class SoftphoneApp(QMainWindow):
         if self._preview is not None:
             self._stop_preview()
             return
+        if self._remote_window is not None:
+            self._warn(
+                "Vídeo",
+                "Não é possível usar a prévia da câmera e o vídeo da chamada "
+                "ao mesmo tempo.",
+                self.video_win,
+            )
+            return
         dev = self._selected_camera()
         if dev < 0:
             self._info("Prévia", "Selecione uma câmera na lista acima.", self.video_win)
@@ -5998,33 +6147,69 @@ class SoftphoneApp(QMainWindow):
             prm = pj.VideoPreviewOpParam()
             prm.show = True
             frame.set_placeholder()
-            frame.get_label().setText("Prévia aberta em janela separada do renderer")
+            frame.get_label().setText("Iniciando prévia...")
+            # Pede ao pjsua2 para já criar a prévia embutida na área
+            # "Vídeo da chamada" (mesma superfície do vídeo remoto).
+            embedded = False
+            surface = self.video_surface
+            if surface is not None:
+                try:
+                    surface.hide_placeholder()
+                    prm.window = _native_video_handle(surface.xid())
+                    embedded = True
+                except Exception as e:
+                    logging.warning("Não foi possível preparar a janela da prévia: %s", e)
             self._preview = pj.VideoPreview(dev)
             self._preview.start(prm)
+            if not embedded:
+                self._embed_preview_window()
             self._ensure_preview_window_visible()
             QTimer.singleShot(400, self._fit_preview_area)
-            self._mirror_on = bool(self.config_data.get("preview_mirror"))
-            if self._mirror_on:
-                try:
-                    self._preview.getVideoWindow().setMirror(True)
-                except Exception:
-                    pass
-                self.btn_video_mirror.setText("Espelhado ✓")
-            else:
-                self.btn_video_mirror.setText("🪞 Espelhar")
             self.btn_video_preview.setText("Atual. prévia")
             logging.info("Prévia da câmera %s iniciada (janela nativa do renderer)", dev)
         except Exception as e:
             self._preview = None
             self._error("Prévia", f"Não foi possível iniciar a prévia da câmera:\n{e}", self.video_win)
 
-    def _ensure_preview_window_visible(self):
-        """Garante que a janela nativa do renderer (SDL) fique visível.
+    def _embed_video_window(self, win):
+        """Embute uma janela nativa de vídeo do pjsua2 na área "Vídeo da chamada".
 
-        Este build do pjsua2 só traz o renderer SDL (sem X11), então a prévia
-        é sempre desenhada numa janela própria do renderer; aqui forçamos a
-        exibição caso ela tenha sido criada escondida e logamos o estado para
-        diagnóstico.
+        Usada tanto para o vídeo remoto da chamada quanto para a prévia da
+        câmera — a mesma superfície, já que nunca exibimos os dois ao mesmo
+        tempo.
+        """
+        surface = self.video_surface
+        if surface is None or win is None:
+            return False
+        try:
+            surface.hide_placeholder()
+            xid = surface.xid()
+            win.setWindow(_native_video_handle(xid))
+            win.Show(True)
+            self._fit_native_window(win, surface)
+            logging.info("Janela de vídeo embutida na área 'Vídeo da chamada' (xid=%s)", xid)
+            return True
+        except Exception as e:
+            logging.warning("Não foi possível embutir a janela de vídeo: %s", e)
+            return False
+
+    def _embed_preview_window(self):
+        if self._preview is None:
+            return False
+        try:
+            win = self._preview.getVideoWindow()
+        except Exception:
+            win = None
+        if win is None:
+            logging.warning("Prévia iniciada, mas sem janela de vídeo disponível")
+            return False
+        return self._embed_video_window(win)
+
+    def _ensure_preview_window_visible(self):
+        """Garante que a janela nativa do renderer fique visível.
+
+        Depois de embutir a prévia na área "Vídeo da chamada", apenas logamos o
+        estado e forçamos a exibição caso ela tenha sido criada escondida.
         """
         try:
             win = self._preview.getVideoWindow()
@@ -6047,12 +6232,17 @@ class SoftphoneApp(QMainWindow):
     def _on_preview_area_configure(self, event):
         self._fit_preview_area()
 
-    def _fit_preview_area(self):
-        frame = getattr(self, "video_preview_frame", None)
-        if frame is None or self._preview is None:
+    def _on_video_surface_resize(self):
+        """Reajusta a janela nativa ativa quando a área de vídeo muda de tamanho."""
+        if self._preview is not None:
+            self._fit_preview_area()
+        elif self._remote_window is not None:
+            self._fit_native_window(self._remote_window, self.video_surface)
+
+    def _fit_native_window(self, win, frame):
+        if win is None or frame is None:
             return
         try:
-            win = self._preview.getVideoWindow()
             size = pj.MediaSize()
             size.w = int(frame.width())
             size.h = int(frame.height())
@@ -6063,21 +6253,19 @@ class SoftphoneApp(QMainWindow):
                 size.w = 800
             if size.w > 0 and size.h > 0:
                 win.setSize(size)
-                logging.info("Prévia redimensionada para %sx%s", size.w, size.h)
+                logging.info("Vídeo redimensionado para %sx%s", size.w, size.h)
         except Exception as e:
-            logging.debug("Não foi possível ajustar a prévia: %s", e)
+            logging.debug("Não foi possível ajustar a janela de vídeo: %s", e)
 
-    def _toggle_mirror(self):
-        if self._preview is None:
+    def _fit_preview_area(self):
+        frame = getattr(self, "video_preview_frame", None)
+        if frame is None or self._preview is None:
             return
         try:
-            self._mirror_on = not getattr(self, "_mirror_on", False)
-            self._preview.getVideoWindow().setMirror(self._mirror_on)
-            self.btn_video_mirror.setText("Espelhado ✓" if self._mirror_on else "🪞 Espelhar")
-            self.config_data["preview_mirror"] = self._mirror_on
-            save_config(self.config_data)
-        except Exception as e:
-            logging.warning("Erro ao espelhar prévia: %s", e)
+            win = self._preview.getVideoWindow()
+        except Exception:
+            win = None
+        self._fit_native_window(win, frame)
 
     def _stop_preview(self):
         preview = self._preview
@@ -6095,27 +6283,15 @@ class SoftphoneApp(QMainWindow):
         if hasattr(self, "btn_video_preview"):
             try:
                 self.btn_video_preview.setText("Ver prévia")
-                self.btn_video_mirror.setText("🪞 Espelhar")
             except Exception:
                 pass
-        self._mirror_on = False
 
     # =========================
     # CODECS
     # =========================
     def open_codecs(self):
-        if self.codec_win is None:
-            win = QDialog(self)
-            win.setWindowTitle("Configurações de Codecs")
-            _decorate_window(win)
-            win.resize(560, 560)
-            win.setMinimumSize(500, 460)
-            self.codec_win = win
-            self._build_codec_ui(win)
-            self.refresh_codec_list()
-        self.codec_win.show()
-        self.codec_win.raise_()
-        self.codec_win.activateWindow()
+        # Codecs agora é uma aba da janela unificada de Configurações avançadas.
+        self.open_advanced_tabs(tab="Codecs")
 
     def _close_codecs(self):
         if self.codec_win is not None:
@@ -6157,15 +6333,15 @@ class SoftphoneApp(QMainWindow):
 
         btns = QHBoxLayout()
         btn_ena = RoundedButton(self, "Ativar", lambda: self._codec_action("enable"),
-                                COLOR_SUCCESS, fg="#FFFFFF", pady=5)
+                                COLOR_SUCCESS, fg="#FFFFFF", pady=5, padding="5px 6px")
         btn_dis = RoundedButton(self, "Desativar", lambda: self._codec_action("disable"),
-                                COLOR_DANGER, fg="#FFFFFF", pady=5)
+                                COLOR_DANGER, fg="#FFFFFF", pady=5, padding="5px 6px")
         btn_up = RoundedButton(self, "Prioridade +", lambda: self._codec_action("up"),
-                               COLOR_PRIMARY, fg="#FFFFFF", pady=5)
+                               COLOR_PRIMARY, fg="#FFFFFF", pady=5, padding="5px 6px")
         btn_down = RoundedButton(self, "Prioridade −", lambda: self._codec_action("down"),
-                                 COLOR_PRIMARY, fg="#FFFFFF", pady=5)
+                                 COLOR_PRIMARY, fg="#FFFFFF", pady=5, padding="5px 6px")
         btn_ref = RoundedButton(self, "Atualizar", self.refresh_codec_list,
-                                COLOR_MUTED, fg=secondary_button_fg(), pady=5)
+                                COLOR_MUTED, fg=secondary_button_fg(), pady=5, padding="5px 6px")
         for b in (btn_ena, btn_dis, btn_up, btn_down, btn_ref):
             btns.addWidget(b)
         lay.addLayout(btns)
@@ -7413,17 +7589,9 @@ class SoftphoneApp(QMainWindow):
             logging.debug("Não foi possível abrir a pasta de downloads: %s", e)
 
     def open_provision(self):
-        if self.prov_win is None:
-            win = QDialog(self)
-            win.setWindowTitle("Provisionamento")
-            _decorate_window(win)
-            win.resize(520, 600)
-            win.setMinimumSize(480, 520)
-            self.prov_win = win
-            self._build_provision_ui(win)
-        self.prov_win.show()
-        self.prov_win.raise_()
-        self.prov_win.activateWindow()
+        # Provisionamento agora é uma aba da janela unificada de Configurações
+        # avançadas.
+        self.open_advanced_tabs(tab="Provisionamento")
 
     def _build_provision_ui(self, win):
         lay = QVBoxLayout(win)
